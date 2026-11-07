@@ -359,17 +359,50 @@ def _hresult(e: BaseException) -> Any:
     return hr
 
 
-def _com_retry(fn: Any, timeout_s: float | None = None) -> Any:
-    """Call fn(), retrying while AutoCAD rejects the call because it is busy."""
+def _com_retry(fn: Any, timeout_s: float | None = None, retry_attr: bool = False) -> Any:
+    """Call fn(), retrying while AutoCAD rejects the call because it is busy.
+
+    retry_attr: also retry AttributeError. win32com's late binding reports a
+    property lookup AutoCAD rejected (e.g. while a large drawing with xrefs is
+    still loading) as AttributeError('Open.ModelSpace'), not as a COM error.
+    """
     deadline = time.monotonic() + (AUTOCAD_BUSY_TIMEOUT if timeout_s is None else timeout_s)
     while True:
         try:
             return fn()
+        except AttributeError:
+            if retry_attr and time.monotonic() < deadline:
+                time.sleep(0.5)
+                continue
+            raise
         except Exception as e:
             if _hresult(e) in _RETRY_HRESULTS and time.monotonic() < deadline:
                 time.sleep(0.5)
                 continue
             raise
+
+
+def _close_if_open(acad: Any, path: Path) -> None:
+    """Close (without saving) a copy of this drawing still open from an earlier failed run."""
+    target = str(path.resolve()).lower()
+    try:
+        docs = acad.Documents
+        for i in range(int(docs.Count) - 1, -1, -1):
+            d = docs.Item(i)
+            if str(getattr(d, "FullName", "")).lower() == target:
+                _com_retry(lambda d=d: d.Close(False), timeout_s=60)
+    except Exception as e:
+        log.debug(f"Could not check open drawings: {e}")
+
+
+def _drawing_spaces(doc: Any) -> list[Any]:
+    """Model space + every paper-space layout block."""
+    spaces = [doc.ModelSpace]
+    for i in range(doc.Layouts.Count):
+        layout = doc.Layouts.Item(i)
+        if layout.Name.upper() != "MODEL":
+            spaces.append(layout.Block)
+    return spaces
 
 
 def _wait_until_idle(acad: Any, timeout_s: float | None = None) -> None:
@@ -439,6 +472,7 @@ def update_dwg_via_autocad_com(
         except Exception:
             pass
 
+        _close_if_open(acad, dwg_path)
         doc = _com_retry(lambda: acad.Documents.Open(str(dwg_path.resolve())))
         _wait_until_idle(acad)
         modified = False
@@ -446,12 +480,8 @@ def update_dwg_via_autocad_com(
         seen_text: list[str] = []
 
         try:
-            # Iterate ModelSpace + all PaperSpace Layouts
-            spaces = [doc.ModelSpace]
-            for i in range(doc.Layouts.Count):
-                layout = doc.Layouts.Item(i)
-                if layout.Name.upper() != "MODEL":
-                    spaces.append(layout.Block)
+            # Model space + every layout; retried until the drawing has finished loading
+            spaces = _com_retry(lambda: _drawing_spaces(doc), retry_attr=True)
 
             for space in spaces:
                 for idx in range(space.Count):
@@ -504,10 +534,12 @@ def update_dwg_via_autocad_com(
                 f"⚠️ nothing in the title block matched via AutoCAD COM — original DWG preserved ({dwg_path.name})",
             )
         finally:
+            # Always close, or the drawing stays open in AutoCAD after a failure
+            # (and blocks the idle-close, which waits for no open drawings).
             try:
-                doc.Close(False)
-            except Exception:
-                pass
+                _com_retry(lambda: doc.Close(False), timeout_s=60, retry_attr=True)
+            except Exception as e:
+                log.warning(f"Could not close {dwg_path.name} in AutoCAD: {e}")
             # Kept open for the rest of the ECM package; app_keeper closes it
             # after AUTOCAD_IDLE_MIN idle minutes.
             if _ACAD_STATE.owned and not AUTOCAD_KEEP_OPEN:

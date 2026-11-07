@@ -146,6 +146,46 @@ class TestAvailability(unittest.TestCase):
             self.assertFalse(autocad_engine.is_autocad_com_available())
 
 
+class _LoadingDoc(_Doc):
+    """A large drawing still loading: ModelSpace lookups fail for a while (as win32com reports it)."""
+
+    def __init__(self, ents, fail_times):
+        super().__init__(ents)
+        self._space = self.__dict__.pop("ModelSpace")
+        self._fails = fail_times
+
+    def __getattr__(self, name):
+        if name == "ModelSpace":
+            if self._fails > 0:
+                self._fails -= 1
+                raise AttributeError("Open.ModelSpace")
+            return self._space
+        raise AttributeError(name)
+
+
+class TestLargeDrawing(unittest.TestCase):
+    def test_modelspace_retried_while_loading_and_doc_closed(self):
+        doc = _LoadingDoc([
+            _Ent("AcDbMText", "PROPOSED ERECTION OF SOMETHING", 300),
+            _Ent("AcDbText", "A2311-00029"),
+        ], fail_times=3)
+        acad = types.SimpleNamespace(Visible=False, Documents=types.SimpleNamespace(
+            Open=lambda p: doc, Count=0, Item=lambda i: None))
+        client = types.ModuleType("win32com.client")
+        client.GetActiveObject = lambda prog: acad
+        client.Dispatch = lambda prog: acad
+        win32 = types.ModuleType("win32com")
+        win32.client = client
+        pycom = types.ModuleType("pythoncom")
+        pycom.CoInitialize = pycom.CoUninitialize = lambda: None
+        with patch.dict(sys.modules, {"win32com": win32, "win32com.client": client, "pythoncom": pycom}), \
+             patch.object(autocad_engine.time, "sleep", lambda s: None):
+            ok, msg = autocad_engine.update_dwg_via_autocad_com(Path("C:/x/ECM Plan.dwg"), FIELDS, {})
+        self.assertTrue(ok, msg)
+        self.assertTrue(doc.saved)
+        self.assertIs(doc.closed_with, False)
+
+
 class TestProgIds(unittest.TestCase):
     def test_order(self):
         with patch.dict("os.environ", {}, clear=False):
