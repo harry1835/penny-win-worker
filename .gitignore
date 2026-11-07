@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.sdb
+*.s2k
+*.$2k
+*.dwg
+*.dxf
+*.log
+.pytest_cache/
