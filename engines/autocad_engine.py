@@ -471,21 +471,23 @@ def _update_dwg_title_block_inner(
         return False, f"⚠️ DWG file not found: {dwg_path.name}", None, "none"
 
     # Tier 1: Try native AutoCAD COM if available on Windows
+    com_error = ""
     if is_autocad_com_available():
         try:
             ok, msg = update_dwg_via_autocad_com(dwg_path, fields, field_map)
             return ok, msg, dwg_path, "autocad_com"
         except Exception as e:
-            log.warning(f"AutoCAD COM failed ({e}), falling back to ODA+ezdxf...")
+            com_error = f"{type(e).__name__}: {e}"
+            log.warning(f"AutoCAD COM failed on {dwg_path.name} ({com_error}), falling back to ODA+ezdxf...")
 
     # Tier 2: ODA File Converter + ezdxf
     if not find_oda_executable():
-        return (
-            False,
-            "⚠️ untouched (neither AutoCAD COM nor ODA File Converter installed on worker)",
-            dwg_path,
-            "none",
+        reason = (
+            f"AutoCAD COM failed ({com_error[:160]}) and no ODA File Converter on worker"
+            if com_error else
+            "AutoCAD.Application is not registered and no ODA File Converter on worker"
         )
+        return False, f"⚠️ untouched ({reason})", dwg_path, "none"
 
     with tempfile.TemporaryDirectory(prefix="penny_oda_") as tmpdir:
         tmp = Path(tmpdir)
