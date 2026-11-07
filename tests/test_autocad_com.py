@@ -144,3 +144,33 @@ class TestAvailability(unittest.TestCase):
         with patch.object(autocad_engine.sys, "platform", "win32"), \
              patch.object(autocad_engine, "pywin32_installed", return_value=False):
             self.assertFalse(autocad_engine.is_autocad_com_available())
+
+
+class TestProgIds(unittest.TestCase):
+    def test_order(self):
+        with patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("AUTOCAD_PROGID", None)
+            got = autocad_engine.order_progids(
+                ["AutoCAD.Application.25.1", "AutoCAD.Application.26", "AutoCAD.Application.24"],
+                curver=None, generic_has_clsid=False)
+            self.assertEqual(got, ["AutoCAD.Application.26", "AutoCAD.Application.25.1", "AutoCAD.Application.24"])
+            self.assertEqual(autocad_engine.order_progids([], "AutoCAD.Application.26", True),
+                             ["AutoCAD.Application", "AutoCAD.Application.26"])
+        with patch.dict("os.environ", {"AUTOCAD_PROGID": "AutoCAD.Application.27"}):
+            self.assertEqual(autocad_engine.order_progids(["AutoCAD.Application.26"], None, True)[0],
+                             "AutoCAD.Application.27")
+
+    def test_invalid_class_string_moves_to_next_name(self):
+        tried = []
+
+        def dispatch(p):
+            tried.append(p)
+            if p == "AutoCAD.Application":
+                raise _ComError(-2147221005, "Invalid class string")
+            return "acad"
+        client = types.SimpleNamespace(Dispatch=dispatch)
+        with patch.object(autocad_engine, "autocad_progids",
+                          return_value=["AutoCAD.Application", "AutoCAD.Application.26"]):
+            self.assertEqual(autocad_engine._start_autocad(client), "acad")
+        self.assertEqual(tried, ["AutoCAD.Application", "AutoCAD.Application.26"])
