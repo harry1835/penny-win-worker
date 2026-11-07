@@ -137,3 +137,10 @@ class TestBusyRetry(TestAutoCADCom):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAvailability(unittest.TestCase):
+    def test_autocad_not_available_without_pywin32(self):
+        with patch.object(autocad_engine.sys, "platform", "win32"), \
+             patch.object(autocad_engine, "pywin32_installed", return_value=False):
+            self.assertFalse(autocad_engine.is_autocad_com_available())

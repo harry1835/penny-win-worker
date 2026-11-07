@@ -74,9 +74,22 @@ def find_oda_executable() -> str | None:
     return None
 
 
+def pywin32_installed() -> bool:
+    """pywin32 (pythoncom + win32com) is what drives AutoCAD over COM."""
+    try:
+        import pythoncom  # type: ignore[import-not-found]  # noqa: F401
+        import win32com.client  # type: ignore[import-not-found]  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def is_autocad_com_available() -> bool:
     """Return True if pywin32 is installed and AutoCAD ProgID is registered in Windows Registry."""
     if sys.platform != "win32":
+        return False
+    if not pywin32_installed():
+        # AutoCAD may be installed, but this Python cannot drive it.
         return False
     try:
         import winreg  # type: ignore[import-not-found]
@@ -108,6 +121,7 @@ def get_dwg_engine_status() -> dict[str, Any]:
         "autocad_available": active != "none",
         "dwg_engine": active,
         "autocad_com_registered": com_ok,
+        "pywin32_installed": pywin32_installed(),
         "oda_executable": oda_bin,
         "ezdxf_installed": ezdxf_ok,
     }
