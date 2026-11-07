@@ -74,16 +74,123 @@ def find_oda_executable() -> str | None:
     return None
 
 
-def is_autocad_com_available() -> bool:
-    """Return True if pywin32 is installed and AutoCAD ProgID is registered in Windows Registry."""
+def pywin32_installed() -> bool:
+    """pywin32 (pythoncom + win32com) is what drives AutoCAD over COM."""
+    try:
+        import pythoncom  # type: ignore[import-not-found]  # noqa: F401
+        import win32com.client  # type: ignore[import-not-found]  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+_CO_E_CLASSSTRING = -2147221005  # "Invalid class string": ProgID does not resolve
+
+
+def _version_key(progid: str) -> tuple[int, ...]:
+    tail = progid[len("AutoCAD.Application"):].lstrip(".")
+    try:
+        return tuple(int(p) for p in tail.split(".") if p)
+    except ValueError:
+        return ()
+
+
+def order_progids(versioned: list[str], curver: str | None, generic_has_clsid: bool) -> list[str]:
+    """
+    COM names to try for AutoCAD, best first: AUTOCAD_PROGID override, the
+    generic name if it resolves, its CurVer target, then versioned names newest
+    first (AutoCAD.Application.26, .25.1, ...). Recent AutoCAD releases can leave
+    the generic name without a CLSID ("Invalid class string").
+    """
+    out: list[str] = []
+    override = os.getenv("AUTOCAD_PROGID", "").strip()
+    for p in [override] + (["AutoCAD.Application"] if generic_has_clsid else []) + [curver or ""] \
+            + sorted(versioned, key=_version_key, reverse=True):
+        if p and p not in out:
+            out.append(p)
+    return out or ["AutoCAD.Application"]
+
+
+_PROGIDS_CACHE: list[str] | None = None
+
+
+def autocad_progids() -> list[str]:
+    """Registered AutoCAD COM names on this machine (cached)."""
+    global _PROGIDS_CACHE
+    if _PROGIDS_CACHE is not None:
+        return _PROGIDS_CACHE
     if sys.platform != "win32":
+        return order_progids([], None, True)
+    import winreg  # type: ignore[import-not-found]
+
+    def has_clsid(name: str) -> bool:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, name + "\\CLSID"):
+                return True
+        except OSError:
+            return False
+
+    curver = None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "AutoCAD.Application\\CurVer") as k:
+            curver = str(winreg.QueryValue(k, None) or "") or None
+    except OSError:
+        pass
+    versioned: list[str] = []
+    try:
+        i = 0
+        while True:
+            name = winreg.EnumKey(winreg.HKEY_CLASSES_ROOT, i)
+            i += 1
+            if name.lower().startswith("autocad.application.") and has_clsid(name):
+                versioned.append(name)
+    except OSError:
+        pass  # end of enumeration
+    if curver and not has_clsid(curver):
+        curver = None
+    _PROGIDS_CACHE = order_progids(versioned, curver, has_clsid("AutoCAD.Application"))
+    return _PROGIDS_CACHE
+
+
+def is_autocad_com_available() -> bool:
+    """Return True if pywin32 is installed and an AutoCAD ProgID is registered in Windows Registry."""
+    if sys.platform != "win32":
+        return False
+    if not pywin32_installed():
+        # AutoCAD may be installed, but this Python cannot drive it.
         return False
     try:
         import winreg  # type: ignore[import-not-found]
         with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "AutoCAD.Application"):
             return True
     except Exception:
-        return False
+        return bool([p for p in autocad_progids() if p != "AutoCAD.Application"])
+
+
+def _get_running_autocad(win32com_client: Any) -> Any:
+    """Attach to a running AutoCAD under any of its COM names, or None."""
+    for progid in autocad_progids():
+        try:
+            return win32com_client.GetActiveObject(progid)
+        except Exception:
+            continue
+    return None
+
+
+def _start_autocad(win32com_client: Any) -> Any:
+    """Start AutoCAD, trying each registered COM name until one resolves."""
+    last: Exception | None = None
+    tried = []
+    for progid in autocad_progids():
+        tried.append(progid)
+        try:
+            return _com_retry(lambda p=progid: win32com_client.Dispatch(p))
+        except Exception as e:
+            last = e
+            if _hresult(e) == _CO_E_CLASSSTRING:
+                continue  # this name does not resolve; try the next
+            raise
+    raise RuntimeError(f"no AutoCAD COM name resolved (tried {', '.join(tried)}): {last}")
 
 
 def get_dwg_engine_status() -> dict[str, Any]:
@@ -108,6 +215,8 @@ def get_dwg_engine_status() -> dict[str, Any]:
         "autocad_available": active != "none",
         "dwg_engine": active,
         "autocad_com_registered": com_ok,
+        "pywin32_installed": pywin32_installed(),
+        "autocad_progids": autocad_progids() if com_ok else [],
         "oda_executable": oda_bin,
         "ezdxf_installed": ezdxf_ok,
     }
@@ -319,10 +428,9 @@ def update_dwg_via_autocad_com(
     pythoncom.CoInitialize()
     _register_busy_message_filter(pythoncom)
     try:
-        try:
-            acad = win32com.client.GetActiveObject("AutoCAD.Application")
-        except Exception:
-            acad = _com_retry(lambda: win32com.client.Dispatch("AutoCAD.Application"))
+        acad = _get_running_autocad(win32com.client)
+        if acad is None:
+            acad = _start_autocad(win32com.client)
             _ACAD_STATE.owned = True  # we started it, so we may close it
         _wait_until_idle(acad)
 
@@ -662,9 +770,8 @@ def reap_idle_autocad(now: float | None = None) -> bool:
 
         pythoncom.CoInitialize()
         try:
-            try:
-                acad = win32com.client.GetActiveObject("AutoCAD.Application")
-            except Exception:
+            acad = _get_running_autocad(win32com.client)
+            if acad is None:
                 _ACAD_STATE.owned = False  # already gone
                 return False
             if int(acad.Documents.Count) > 0:
