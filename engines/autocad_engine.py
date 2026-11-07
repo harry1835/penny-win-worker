@@ -177,6 +177,91 @@ def _get_running_autocad(win32com_client: Any) -> Any:
     return None
 
 
+AUTOCAD_START_TIMEOUT = float(os.getenv("AUTOCAD_START_TIMEOUT", "240"))
+
+
+def _exe_from_command(cmd: str) -> str | None:
+    """'"C:\\...\\acad.exe" /Automation' -> 'C:\\...\\acad.exe'."""
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return None
+    if cmd.startswith('"'):
+        return cmd[1:].split('"', 1)[0] or None
+    low = cmd.lower()
+    i = low.find(".exe")
+    return cmd[: i + 4] if i >= 0 else cmd.split(" ", 1)[0]
+
+
+def autocad_exe() -> str | None:
+    """
+    Path to acad.exe: AUTOCAD_EXE override, else the LocalServer32 registered
+    for AutoCAD's COM class, else the newest C:\\Program Files\\Autodesk\\AutoCAD *\\acad.exe.
+    """
+    override = os.getenv("AUTOCAD_EXE", "").strip()
+    if override:
+        return override
+    if sys.platform == "win32":
+        try:
+            import winreg  # type: ignore[import-not-found]
+
+            for progid in autocad_progids():
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, progid + "\\CLSID") as k:
+                        clsid = str(winreg.QueryValue(k, None) or "")
+                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{clsid}\\LocalServer32") as k:
+                        exe = _exe_from_command(str(winreg.QueryValue(k, None) or ""))
+                    if exe and Path(exe).exists():
+                        return exe
+                except OSError:
+                    continue
+        except Exception:
+            pass
+        root = Path(r"C:\Program Files\Autodesk")
+        if root.exists():
+            found = sorted(root.glob("AutoCAD */acad.exe"), reverse=True)
+            if found:
+                return str(found[0])
+    return None
+
+
+def _launch_and_attach(win32com_client: Any, exe: str, timeout_s: float | None = None) -> Any:
+    """
+    Start acad.exe the way a double-click does, in this (interactive) session,
+    and wait for it to register so GetActiveObject can attach. COM activation
+    (Dispatch) can fail with CO_E_SERVER_EXEC_FAILURE on machines where the
+    desktop launch works fine.
+    """
+    import subprocess
+
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen([exe, "/nologo"], creationflags=flags, close_fds=True)
+    deadline = time.monotonic() + (AUTOCAD_START_TIMEOUT if timeout_s is None else timeout_s)
+    while time.monotonic() < deadline:
+        acad = _get_running_autocad(win32com_client)
+        if acad is not None:
+            return acad
+        time.sleep(2.0)
+    raise RuntimeError(f"AutoCAD started ({exe}) but did not register within {AUTOCAD_START_TIMEOUT:.0f} s")
+
+
+def _open_autocad(win32com_client: Any) -> Any:
+    """Running AutoCAD, else start acad.exe directly, else COM activation."""
+    acad = _get_running_autocad(win32com_client)
+    if acad is not None:
+        return acad
+    exe = autocad_exe()
+    if exe:
+        try:
+            acad = _launch_and_attach(win32com_client, exe)
+            _ACAD_STATE.owned = True
+            return acad
+        except Exception as e:
+            log.warning(f"Launching {exe} failed ({e}); trying COM activation")
+    acad = _start_autocad(win32com_client)
+    _ACAD_STATE.owned = True
+    return acad
+
+
 def _start_autocad(win32com_client: Any) -> Any:
     """Start AutoCAD, trying each registered COM name until one resolves."""
     last: Exception | None = None
@@ -217,6 +302,7 @@ def get_dwg_engine_status() -> dict[str, Any]:
         "autocad_com_registered": com_ok,
         "pywin32_installed": pywin32_installed(),
         "autocad_progids": autocad_progids() if com_ok else [],
+        "autocad_exe": autocad_exe() if com_ok else None,
         "oda_executable": oda_bin,
         "ezdxf_installed": ezdxf_ok,
     }
@@ -461,10 +547,9 @@ def update_dwg_via_autocad_com(
     pythoncom.CoInitialize()
     _register_busy_message_filter(pythoncom)
     try:
-        acad = _get_running_autocad(win32com.client)
-        if acad is None:
-            acad = _start_autocad(win32com.client)
-            _ACAD_STATE.owned = True  # we started it, so we may close it
+        # We only ever close an AutoCAD we started (owned): a session someone
+        # opened on the VM is attached to and left running.
+        acad = _open_autocad(win32com.client)
         _wait_until_idle(acad)
 
         try:
@@ -478,6 +563,7 @@ def update_dwg_via_autocad_com(
         modified = False
         tag_to_val = _build_tag_map(fields, field_map)
         seen_text: list[str] = []
+        written_text: list[str] = []  # what the rules wrote, to know which fields this drawing carries
 
         try:
             # Model space + every layout; retried until the drawing has finished loading
@@ -495,6 +581,7 @@ def update_dwg_via_autocad_com(
                                 att.TextString = tag_to_val[tag]
                                 att.Update()
                                 modified = True
+                                written_text.append(tag_to_val[tag])
                             seen_text.append(str(att.TextString or ""))
 
                     elif obj_name == "AcDbMText":
@@ -506,6 +593,7 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_text
                             ent.Update()
                             modified = True
+                            written_text.append(new_text)
                         seen_text.append(str(ent.TextString or ""))
 
                     elif obj_name == "AcDbText":
@@ -515,20 +603,24 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_val
                             ent.Update()
                             modified = True
+                            written_text.append(new_val)
                         seen_text.append(str(ent.TextString or ""))
 
             if modified:
-                # Read back what the drawing now says: a template whose text the
-                # rules don't recognise must not pass with a green tick.
-                missing = missing_values_in_text("\n".join(seen_text), fields)
+                # Read back what the drawing now says. Only fields this drawing
+                # actually carries are checked (a plan sheet has no ref no.),
+                # but each one written must be there after the edit.
+                written = fields_in_text("\n".join(written_text), fields)
+                missing = [k for k in written if k in missing_values_in_text("\n".join(seen_text), fields)]
                 if missing:
                     return (
                         False,
-                        f"⚠️ AutoCAD edit incomplete — {', '.join(missing[:3])} not found in the "
+                        f"⚠️ AutoCAD edit incomplete — {', '.join(missing[:3])} did not stick in the "
                         f"title block; original DWG preserved ({dwg_path.name})",
                     )
                 _com_retry(doc.Save)
-                return True, f"✅ title block updated natively in AutoCAD and verified ({dwg_path.name})"
+                what = ", ".join(_FIELD_LABELS.get(k, k) for k in written) or "road name"
+                return True, f"✅ updated natively in AutoCAD and verified: {what} ({dwg_path.name})"
             return (
                 False,
                 f"⚠️ nothing in the title block matched via AutoCAD COM — original DWG preserved ({dwg_path.name})",
@@ -591,6 +683,23 @@ def dxf_to_dwg_oda(dxf_path: Path, out_dir: Path, target_version: str = "ACAD201
         return dwg_candidate
     log.warning(f"ODA DXF->DWG failed (code {code}): {stderr or stdout}")
     return None
+
+
+_FIELD_LABELS = {
+    "project_title": "project title", "ref_no": "ref no", "client_name": "client",
+    "contractor_name": "contractor", "road_name": "road name",
+}
+
+
+def fields_in_text(text: str, fields: dict[str, str]) -> list[str]:
+    """Which title-block fields (by their cleaned value) appear in `text`."""
+    upper = text.upper()
+    out = []
+    for key in ("project_title", "ref_no", "client_name", "contractor_name", "road_name"):
+        probe = clean_caps(fields.get(key, ""))[:24].strip()
+        if probe and probe in upper:
+            out.append(key)
+    return out
 
 
 def missing_values_in_text(text: str, fields: dict[str, str]) -> list[str]:

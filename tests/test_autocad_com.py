@@ -102,14 +102,29 @@ class TestAutoCADCom(unittest.TestCase):
         self.assertIn("WAYTECH", doc.ModelSpace.ents[2].TextString)  # PE block untouched
         self.assertFalse(acad.quit_called)  # kept warm for the next DWG
 
-    def test_incomplete_edit_is_not_saved(self):
-        # the template's ref-no text doesn't match any rule → ref_no never written
+    def test_drawing_without_a_ref_no_is_still_updated(self):
+        # e.g. the ECM plan sheet: project title only, no ref-no text to replace
         ok, msg, doc, _ = self._run([
             _Ent("AcDbMText", "PROPOSED ERECTION OF SOMETHING", 300),
             _Ent("AcDbText", "REF: UNKNOWN-FORMAT"),
         ])
+        self.assertTrue(ok, msg)
+        self.assertIn("project title", msg)
+        self.assertNotIn("ref no", msg)
+        self.assertTrue(doc.saved)
+
+    def test_value_that_does_not_stick_is_not_saved(self):
+        class _ReadOnly(_Ent):
+            def __setattr__(self, k, v):
+                if k == "TextString" and "TextString" in self.__dict__:
+                    return  # AutoCAD ignored the write (locked layer, field, ...)
+                super().__setattr__(k, v)
+        ok, msg, doc, _ = self._run([
+            _ReadOnly("AcDbMText", "PROPOSED ERECTION OF SOMETHING", 300),
+            _Ent("AcDbText", "A2311-00029"),
+        ])
         self.assertFalse(ok)
-        self.assertIn("ref_no", msg)
+        self.assertIn("project_title", msg)
         self.assertFalse(doc.saved)
         self.assertFalse(doc.closed_with)
 
@@ -214,3 +229,40 @@ class TestProgIds(unittest.TestCase):
                           return_value=["AutoCAD.Application", "AutoCAD.Application.26"]):
             self.assertEqual(autocad_engine._start_autocad(client), "acad")
         self.assertEqual(tried, ["AutoCAD.Application", "AutoCAD.Application.26"])
+
+
+class TestLaunch(unittest.TestCase):
+    def tearDown(self):
+        autocad_engine._ACAD_STATE.owned = False
+
+    def test_exe_from_registry_command(self):
+        f = autocad_engine._exe_from_command
+        self.assertEqual(f('"C:\\Program Files\\Autodesk\\AutoCAD 2027\\acad.exe" /Automation'),
+                         "C:\\Program Files\\Autodesk\\AutoCAD 2027\\acad.exe")
+        self.assertEqual(f("C:\\AC\\acad.exe /Automation"), "C:\\AC\\acad.exe")
+        self.assertIsNone(f(""))
+
+    def test_launches_acad_exe_and_attaches_when_it_registers(self):
+        polls = {"n": 0}
+        acad = object()
+
+        def get_running(client):
+            polls["n"] += 1
+            return acad if polls["n"] >= 4 else None  # 1st = "already running?" check
+        launched = []
+        with patch.object(autocad_engine, "_get_running_autocad", side_effect=get_running), \
+             patch.object(autocad_engine, "autocad_exe", return_value="C:\\AC\\acad.exe"), \
+             patch("subprocess.Popen", side_effect=lambda args, **kw: launched.append(args)), \
+             patch.object(autocad_engine.time, "sleep", lambda s: None):
+            got = autocad_engine._open_autocad(types.SimpleNamespace())
+        self.assertIs(got, acad)
+        self.assertEqual(launched, [["C:\\AC\\acad.exe", "/nologo"]])
+        self.assertTrue(autocad_engine._ACAD_STATE.owned)  # ours, so the idle-close may quit it
+
+    def test_running_autocad_is_used_and_not_owned(self):
+        acad = object()
+        with patch.object(autocad_engine, "_get_running_autocad", return_value=acad), \
+             patch("subprocess.Popen") as popen:
+            self.assertIs(autocad_engine._open_autocad(types.SimpleNamespace()), acad)
+        popen.assert_not_called()
+        self.assertFalse(autocad_engine._ACAD_STATE.owned)
