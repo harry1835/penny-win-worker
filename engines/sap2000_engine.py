@@ -126,12 +126,21 @@ def _analyze_sap2000_model_inner(
 
                 # Discover load cases and load combinations
                 ret_lcases = model.LoadCases.GetNameList(0, [])
-                load_cases = list(ret_lcases[2]) if (len(ret_lcases) >= 3 and ret_lcases[2]) else []
+                all_lcases = list(ret_lcases[2]) if (len(ret_lcases) >= 3 and ret_lcases[2]) else []
+
+                # CRITICAL: Filter out non-physical eigenmode cases (e.g. MODAL, BUCKLING).
+                # Modal cases contain arbitrary mass-normalized eigenvectors that can produce
+                # pseudo-displacements and pseudo-forces in the millions of kN / mm, corrupting
+                # the governing engineering envelopes.
+                load_cases = [
+                    lc for lc in all_lcases
+                    if not any(token in lc.upper() for token in ("MODAL", "BUCKL", "EIGEN"))
+                ]
 
                 ret_combos = model.RespCombo.GetNameList(0, [])
                 load_combos = list(ret_combos[2]) if (len(ret_combos) >= 3 and ret_combos[2]) else []
 
-                # Select all load cases and combinations for output extraction
+                # Select only real physical load cases and combinations for output extraction
                 model.Results.Setup.DeselectAllCasesAndCombosForOutput()
                 for lc in load_cases:
                     model.Results.Setup.SetCaseSelectedForOutput(lc)
