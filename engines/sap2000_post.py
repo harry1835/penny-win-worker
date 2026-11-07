@@ -130,6 +130,7 @@ def build_member_chains(
     frames: list[dict[str, Any]],
     restrained: Iterable[str],
     collinear_tol_deg: float = 1.0,
+    interior: dict[str, list] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Group collinear frame objects meeting end-to-end into one physical span. A chain
@@ -144,6 +145,13 @@ def build_member_chains(
     for f in by_name.values():
         at_joint.setdefault(f["i"], []).append(f["name"])
         at_joint.setdefault(f["j"], []).append(f["name"])
+
+    # Joints sitting part-way along another frame (SAP2000 auto-meshes the frame
+    # there) are connected to it, so a bar ending on one is not a free end.
+    hosted: dict[str, int] = {}
+    for fname, items in (interior or {}).items():
+        for item in items:
+            hosted[str(item[0])] = hosted.get(str(item[0]), 0) + 1
 
     cos_tol = math.cos(math.radians(collinear_tol_deg))
 
@@ -198,7 +206,7 @@ def build_member_chains(
         length = _norm(_sub(joints[chain_joints[-1]], joints[chain_joints[0]]))
 
         def is_free(j: str) -> bool:
-            return j not in restrained and len(at_joint.get(j, [])) == 1
+            return j not in restrained and len(at_joint.get(j, [])) == 1 and not hosted.get(j)
 
         cantilever = is_free(chain_joints[0]) != is_free(chain_joints[-1])
         if cantilever and is_free(chain_joints[0]):
@@ -312,6 +320,90 @@ def friendly_design_code(code: str) -> str:
     c = str(code or "")
     if "Eurocode 3" in c:
         return "EN 1993-1-1:2005/A1:2014"
-    if "BS5950" in c.replace(" ", ""):
-        return "BS 5950-2000"
     return c
+
+
+def interior_joints(
+    joints: dict[str, Vec], frames: list[dict[str, Any]], tol_m: float = 1e-3, max_pairs: int = 5_000_000,
+) -> dict[str, list[list[Any]]]:
+    """
+    Joints lying part-way along a frame object, as [joint, t] with 0 < t < 1 sorted
+    by t. SAP2000 connects these to the frame when "auto mesh at intersections" is
+    on (the default), so they move with it and carry load into it.
+    """
+    out: dict[str, list[list[Any]]] = {}
+    if len(joints) * len(frames) > max_pairs:
+        return out
+    items = list(joints.items())
+    for f in frames:
+        a, b = joints.get(f["i"]), joints.get(f["j"])
+        if a is None or b is None:
+            continue
+        ab = _sub(b, a)
+        L2 = _dot(ab, ab)
+        if L2 <= 0:
+            continue
+        L = math.sqrt(L2)
+        lo = [min(a[k], b[k]) - tol_m for k in range(3)]
+        hi = [max(a[k], b[k]) + tol_m for k in range(3)]
+        hits = []
+        for jn, p in items:
+            if jn in (f["i"], f["j"]):
+                continue
+            if not all(lo[k] <= p[k] <= hi[k] for k in range(3)):
+                continue
+            t = _dot(_sub(p, a), ab) / L2
+            if t * L <= tol_m or (1 - t) * L <= tol_m:
+                continue
+            off = _sub(p, _add(a, _mul(ab, t)))
+            if _norm(off) <= tol_m:
+                hits.append([jn, round(t, 6)])
+        if hits:
+            out[f["name"]] = sorted(hits, key=lambda h: h[1])
+    return out
+
+
+_SYMBOLS_BY_TYPE = {1: "G", 2: "G", 3: "Q", 4: "Q", 5: "E", 6: "W", 7: "S", 10: "T", 11: "Q"}
+
+
+def case_symbol(name: str, pattern_type: Any = None) -> str:
+    """Eurocode action symbol for a load case: G permanent, Q imposed, W wind…"""
+    try:
+        if pattern_type is not None and int(pattern_type) in _SYMBOLS_BY_TYPE:
+            return _SYMBOLS_BY_TYPE[int(pattern_type)]
+    except (TypeError, ValueError):
+        pass
+    u = str(name).upper()
+    if u in ("G", "GK") or any(t in u for t in ("DEAD", "SDL", "SELF", "PERM")):
+        return "G"
+    if u in ("Q", "QK", "LL") or any(t in u for t in ("LIVE", "IMPOSED")):
+        return "Q"
+    if "WIND" in u:
+        return "W"
+    if "SNOW" in u:
+        return "S"
+    if "TEMP" in u:
+        return "T"
+    return str(name)
+
+
+def combo_formula(terms: list[tuple[str, float]], symbols: dict[str, str], envelope: bool = False) -> str:
+    """[(case, 1.35), ("LIVE", 1.5)] -> '1.35G+1.5Q' (cases sharing a symbol keep their names)."""
+    used: dict[str, int] = {}
+    for case, _ in terms:
+        sym = symbols.get(case, case)
+        used[sym] = used.get(sym, 0) + 1
+    parts = []
+    for case, sf in terms:
+        sym = symbols.get(case, case)
+        label = sym if used[sym] == 1 else case
+        mag = f"{abs(sf):g}"
+        coef = "" if mag == "1" else mag
+        sign = "-" if sf < 0 else "+"
+        parts.append((sign, f"{coef}{label}"))
+    if not parts:
+        return ""
+    if envelope:
+        return "Envelope(" + ", ".join((s if s == "-" else "") + t for s, t in parts) + ")"
+    txt = "".join(f"{s}{t}" for s, t in parts)
+    return txt[1:] if txt.startswith("+") else txt

@@ -17,6 +17,9 @@ LX, LY = 2.0, 1.0
 EI = 2.1e8 * (0.012 * 0.09 ** 3 / 12.0)   # 90x12 flat bar, kN·m²
 W_LIVE = 1.0     # kN/m on bearing bars
 N_STA = 11
+# False: the front edge bar (y = LY) is ONE frame object and the bearing bars meet
+# it part-way along (SAP2000 auto-mesh at intersections), like fLASHING.sdb.
+SPLIT_FRONT_EDGE = True
 
 
 class _Enum:
@@ -30,6 +33,7 @@ def make_sap_module():
     sap.eItemTypeElm = _Enum(GroupElm=2, ObjectElm=0)
     sap.eItemType = _Enum(Group=1, Objects=0)
     sap.eLoadCaseType = _Enum(LinearStatic=1, Modal=3)
+    sap.eLoadPatternType = _Enum(Dead=1, Live=3)
     model = FakeModel()
     sap_obj = types.SimpleNamespace(SapModel=model, ApplicationStart=lambda *a: 0, ApplicationExit=lambda *a: 0)
 
@@ -70,6 +74,10 @@ class FakeModel:
                 jid += 1
         fid = 1
         for iy in range(2):
+            if iy == 1 and not SPLIT_FRONT_EDGE:
+                self.frames[str(fid)] = (grid[(0, iy)], grid[(NX - 1, iy)], "100X100X6")
+                fid += 1
+                continue
             for ix in range(NX - 1):
                 self.frames[str(fid)] = (grid[(ix, iy)], grid[(ix + 1, iy)], "90x12mm thk. FB")
                 fid += 1
@@ -79,10 +87,13 @@ class FakeModel:
         self.bearing = [f for f, (i, j, _) in self.frames.items() if self.joints[i][1] != self.joints[j][1]]
         sup_ix = (0, (NX - 1) // 2, NX - 1)
         self.restrained = {grid[(ix, iy)] for ix in sup_ix for iy in range(2)}
+        if not SPLIT_FRONT_EDGE:  # front edge only held at its two ends
+            self.restrained.discard(grid[((NX - 1) // 2, 1)])
         self.selected: list[str] = []
         self.cases = ["DEAD", "MODAL", "LIVE"]
-        self.combos = ["1.35G+1.50Q"]
-        self.factors = {"DEAD": (1.0, 0.0), "LIVE": (0.0, 1.0), "1.35G+1.50Q": (1.35, 1.5)}
+        self.combos = ["1.35G+1.50Q", "DSTL1", "DSTL2"]
+        self.factors = {"DEAD": (1.0, 0.0), "LIVE": (0.0, 1.0), "1.35G+1.50Q": (1.35, 1.5),
+                        "DSTL1": (1.35, 0.0), "DSTL2": (1.35, 1.5)}
 
         m = self
         self.PointObj = _ns(
@@ -103,13 +114,21 @@ class FakeModel:
             GetLoadDistributed=self._get_load_distributed,
             GetLoadPoint=lambda *a: (0, 0, [], [], [], [], [], [], [], []),
         )
-        self.AreaObj = _ns(Count=lambda: 0)
+        corners = [grid[(0, 0)], grid[(NX - 1, 0)], grid[(NX - 1, 1)], grid[(0, 1)]]
+        self.AreaObj = _ns(
+            Count=lambda: 1,
+            GetNameList=lambda n, a: (0, 1, ["A1"]),
+            GetPoints=lambda nm, n, a: (0, 4, corners),
+            GetLoadUniform=lambda *a: (0, 1, ["A1"], ["LIVE"], ["GLOBAL"], [10], [1.5]),
+            GetLoadUniformToFrame=lambda *a: (0, 0, [], [], [], [], [], []),
+        )
         self.PropFrame = _ns(
             GetSectProps=lambda nm, *a: (0, 0.00108, 0, 0, 0, 0.09 * 0.012 ** 3 / 12, 0.012 * 0.09 ** 3 / 12, 0, 0, 0, 0, 0, 0),
             GetMaterial=lambda nm, a: (0, "S275"),
             GetModifiers=lambda nm, arr: (0, [1.0] * 8),
         )
-        self.PropMaterial = _ns(GetMPIsotropic=lambda nm, e, u, a: (0, 2.1e8, 0.3, 1.2e-5))
+        # v25 signature: E, U, A, G
+        self.PropMaterial = _ns(GetMPIsotropic=lambda nm, e, u, a, g: (0, 2.1e8, 0.3, 1.2e-5, 8.08e7))
         self.File = _ns(OpenFile=lambda p: 0, NewBlank=lambda: 0)
         self.Analyze = _ns(RunAnalysis=lambda: 0)
         self.LoadCases = _ns(
@@ -117,8 +136,22 @@ class FakeModel:
             # Real OAPI: (ret, CaseType, SubType). Modal = 3.
             GetTypeOAPI=lambda nm, t, st: (0, 3 if nm == "MODAL" else 1, 0),
         )
-        self.LoadPatterns = _ns(GetNameList=lambda n, a: (0, 2, ["DEAD", "LIVE"]))
-        self.RespCombo = _ns(GetNameList=lambda n, a: (0, len(m.combos), list(m.combos)))
+        self.LoadPatterns = _ns(
+            GetNameList=lambda n, a: (0, 2, ["DEAD", "LIVE"]),
+            GetSelfWTMultiplier=lambda nm, v: (0, 1.0 if nm == "DEAD" else 0.0),
+            GetLoadType=lambda nm, t: (0, 1 if nm == "DEAD" else 3),
+        )
+
+        def _case_list(name, n, types, names, sfs):
+            g, q = m.factors[name]
+            items = [(c, f) for c, f in (("DEAD", g), ("LIVE", q)) if f]
+            return (0, len(items), ["LoadCase"] * len(items), [c for c, _ in items], [f for _, f in items])
+
+        self.RespCombo = _ns(
+            GetNameList=lambda n, a: (0, len(m.combos), list(m.combos)),
+            GetCaseList=_case_list,
+            GetTypeOAPI=lambda nm, t: (0, 0),
+        )
 
         def _desel():
             m.selected = []
@@ -216,4 +249,4 @@ class FakeModel:
         names = list(self.frames)
         ratios = [0.215 if f in self.bearing else 0.89 for f in names]
         k = len(names)
-        return (0, k, names, ratios, [1] * k, [0.5] * k, ["1.35G+1.50Q"] * k, [""] * k, [""] * k)
+        return (0, k, names, ratios, [1] * k, [0.5] * k, ["DSTL2"] * k, [""] * k, [""] * k)
