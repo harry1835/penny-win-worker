@@ -32,6 +32,9 @@ from engines.process_guard import run_with_watchdog
 log = logging.getLogger("penny_win_worker.autocad")
 
 AUTOCAD_EXEC_TIMEOUT = int(os.getenv("AUTOCAD_EXEC_TIMEOUT", "180"))
+# Leave AutoCAD running after a job: an ECM package has several DWGs and
+# AutoCAD's start-up dominates each title-block edit otherwise.
+AUTOCAD_KEEP_OPEN = os.getenv("AUTOCAD_KEEP_OPEN", "1") != "0"
 _CAD_LOCK = threading.Lock()
 
 # Default Windows installation paths for ODA File Converter
@@ -248,6 +251,7 @@ def update_dwg_via_autocad_com(
         doc = acad.Documents.Open(str(dwg_path.resolve()))
         modified = False
         tag_to_val = _build_tag_map(fields, field_map)
+        seen_text: list[str] = []
 
         try:
             # Iterate ModelSpace + all PaperSpace Layouts
@@ -269,6 +273,7 @@ def update_dwg_via_autocad_com(
                                 att.TextString = tag_to_val[tag]
                                 att.Update()
                                 modified = True
+                            seen_text.append(str(att.TextString or ""))
 
                     elif obj_name == "AcDbMText":
                         raw_text = str(ent.TextString or "")
@@ -279,6 +284,7 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_text
                             ent.Update()
                             modified = True
+                        seen_text.append(str(ent.TextString or ""))
 
                     elif obj_name == "AcDbText":
                         raw_val = str(ent.TextString or "")
@@ -287,10 +293,20 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_val
                             ent.Update()
                             modified = True
+                        seen_text.append(str(ent.TextString or ""))
 
             if modified:
+                # Read back what the drawing now says: a template whose text the
+                # rules don't recognise must not pass with a green tick.
+                missing = missing_values_in_text("\n".join(seen_text), fields)
+                if missing:
+                    return (
+                        False,
+                        f"⚠️ AutoCAD edit incomplete — {', '.join(missing[:3])} not found in the "
+                        f"title block; original DWG preserved ({dwg_path.name})",
+                    )
                 doc.Save()
-                return True, f"✅ title block updated natively via AutoCAD COM ({dwg_path.name})"
+                return True, f"✅ title block updated natively in AutoCAD and verified ({dwg_path.name})"
             return (
                 False,
                 f"⚠️ nothing in the title block matched via AutoCAD COM — original DWG preserved ({dwg_path.name})",
@@ -300,7 +316,7 @@ def update_dwg_via_autocad_com(
                 doc.Close(False)
             except Exception:
                 pass
-            if started_new:
+            if started_new and not AUTOCAD_KEEP_OPEN:
                 try:
                     acad.Quit()
                 except Exception:
@@ -347,6 +363,17 @@ def dxf_to_dwg_oda(dxf_path: Path, out_dir: Path, target_version: str = "ACAD201
         return dwg_candidate
     log.warning(f"ODA DXF->DWG failed (code {code}): {stderr or stdout}")
     return None
+
+
+def missing_values_in_text(text: str, fields: dict[str, str]) -> list[str]:
+    """Field keys whose (cleaned) value does not appear in the drawing's text."""
+    upper = text.upper()
+    missing: list[str] = []
+    for key in ("project_title", "ref_no", "client_name", "contractor_name"):
+        probe = clean_caps(fields.get(key, ""))[:24].strip()
+        if probe and probe not in upper:
+            missing.append(key)
+    return missing
 
 
 def missing_values(dxf_path: Path, fields: dict[str, str]) -> list[str]:

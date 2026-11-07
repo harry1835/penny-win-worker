@@ -15,6 +15,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,9 @@ DEFAULT_SAP_DIR = Path(os.getenv(
 ))
 DEFAULT_DLL_PATH = DEFAULT_SAP_DIR / "SAP2000v1.dll"
 SAP2000_EXEC_TIMEOUT = int(os.getenv("SAP2000_EXEC_TIMEOUT", "280"))
+# Load-case types whose solution needs the modal case (response spectrum,
+# modal time history / steady state / PSD). Modal is only skipped without them.
+_NEEDS_MODAL_TYPES = {4, 5, 7, 11, 12}
 
 # Serialize SAP2000 OAPI calls so concurrent requests never clobber COM state
 _SAP_LOCK = threading.Lock()
@@ -551,6 +555,33 @@ def _apply_combo_labels(res: dict[str, Any], labels: dict[str, str]) -> None:
         v["combo_labels"] = labels
 
 
+def _skip_unneeded_eigen_cases(model: Any, sap: Any) -> list[str]:
+    """
+    Don't solve Modal / Buckling cases when nothing depends on them: their
+    results are discarded anyway (mode shapes, not load effects), and an
+    eigen solution is often the slowest part of a run. Kept whenever a
+    response-spectrum or modal time-history case needs the modes.
+    """
+    try:
+        cases = _names(model.LoadCases.GetNameList(0, []))
+        types = {c: _case_type(model, sap, c) for c in cases}
+        as_int: dict[str, int | None] = {}
+        for c, t in types.items():
+            try:
+                as_int[c] = int(t) if t is not None else None
+            except (TypeError, ValueError):
+                as_int[c] = None
+        if any(t in _NEEDS_MODAL_TYPES for t in as_int.values()):
+            return []
+        skip = [c for c in cases if sap2000_post.is_non_physical_case(c, types[c])]
+        for c in skip:
+            model.Analyze.SetRunCaseFlag(c, False, False)
+        return skip
+    except Exception as e:
+        log.debug(f"Could not skip eigen cases: {e}")
+        return []
+
+
 def _truthy(v: Any) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("1", "y", "yes", "true", "on")
@@ -597,6 +628,15 @@ def _analyze_sap2000_model_inner(
     if not src_path.exists():
         raise FileNotFoundError(f"SAP2000 model file not found: {src_path}")
 
+    timings: dict[str, float] = {}
+    t_start = t_last = time.monotonic()
+
+    def stamp(name: str) -> None:
+        nonlocal t_last
+        now = time.monotonic()
+        timings[name] = round(now - t_last, 2)
+        t_last = now
+
     _init_com_thread()
     try:
         sap = _load_sap_module()
@@ -615,6 +655,7 @@ def _analyze_sap2000_model_inner(
                 ret = sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible)
                 if ret != 0:
                     raise RuntimeError(f"SAP2000 ApplicationStart failed with code {ret}")
+            stamp("start_sap2000" if not attached else "attach_sap2000")
 
             try:
                 model = sap_obj.SapModel
@@ -655,10 +696,14 @@ def _analyze_sap2000_model_inner(
                         except Exception:
                             break
 
+                skipped_cases = _skip_unneeded_eigen_cases(model, sap)
+                stamp("open_model")
+
                 # Run structural analysis
                 ret = model.Analyze.RunAnalysis()
                 if ret != 0:
                     raise RuntimeError(f"SAP2000 Analyze.RunAnalysis() failed with code {ret}")
+                stamp("analysis")
 
                 # Discover load cases and load combinations
                 ret_lcases = model.LoadCases.GetNameList(0, [])
@@ -876,6 +921,8 @@ def _analyze_sap2000_model_inner(
                     clean_item = {k: v for k, v in item.items() if k != "_score"}
                     member_envelopes.append(clean_item)
 
+                stamp("results")
+
                 # ── 4. Optional Steel Frame Code Design (DesignSteel) ───────────
                 steel_design_results: list[dict[str, Any]] = []
                 max_steel_ratio = 0.0
@@ -912,6 +959,8 @@ def _analyze_sap2000_model_inner(
                                 steel_design_results.sort(key=lambda x: x["ratio"], reverse=True)
                     except Exception as e:
                         log.debug(f"DesignSteel skipped or not configured in model: {e}")
+
+                stamp("steel_design")
 
                 # ── 5. Data for the SAP2000-style views + member deflection ────
                 try:
@@ -952,6 +1001,7 @@ def _analyze_sap2000_model_inner(
                     if steel_design_results:
                         views["design_code"] = sap2000_post.friendly_design_code(_design_code(model))
 
+                stamp("views")
             finally:
                 if not attached and not keep_open:
                     try:
@@ -965,6 +1015,9 @@ def _analyze_sap2000_model_inner(
                         pass
     finally:
         _uninit_com_thread()
+    stamp("close")
+    timings["total"] = round(time.monotonic() - t_start, 2)
+    log.info(f"SAP2000 run {src_path.name}: {timings}")
 
     # ── 5. Build Engineering Checks ─────────────────────────────────────────
     explicit_disp_limit = bool(inputs.get("deflection_limit_mm"))
@@ -1085,6 +1138,8 @@ def _analyze_sap2000_model_inner(
         "steel_design_results": steel_design_results[:20],
         "member_deflections": member_deflections[:20],
         "views": views,
+        "timings": timings,
+        "skipped_cases": skipped_cases,
     }
     _apply_combo_labels(res, combo_labels)
     return res
