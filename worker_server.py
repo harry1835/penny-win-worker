@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from engines import autocad_engine, sap2000_engine
+from engines import app_keeper, autocad_engine, sap2000_engine
 
 
 def _git_commit() -> str:
@@ -60,7 +60,7 @@ log = logging.getLogger("penny_win_worker.server")
 class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
     """Unified HTTP handler for SAP2000 OAPI and AutoCAD/DWG operations."""
 
-    keep_open: bool = False
+    keep_open: bool = True
     visible: bool = True
     auth_token: str = ""
 
@@ -104,6 +104,9 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
                 "commit_running": _RUNNING_COMMIT,
                 "commit_on_disk": _git_commit(),
                 "restart_needed": _RUNNING_COMMIT != _git_commit(),
+                "work_hours_now": app_keeper.in_work_hours(),
+                "sap2000_held_open": sap2000_engine._SAP_STATE.owned,
+                "autocad_held_open": autocad_engine._ACAD_STATE.owned,
                 **dwg_info,
             })
             return
@@ -246,7 +249,7 @@ def serve_worker(
     host: str = "0.0.0.0",
     port: int = 8085,
     visible: bool = True,
-    keep_open: bool = False,
+    keep_open: bool = True,
     token: str = "",
 ) -> None:
     """Start the unified Windows CAD/CAE HTTP worker server."""
@@ -254,6 +257,13 @@ def serve_worker(
     PennyWindowsWorkerHandler.keep_open = keep_open
     PennyWindowsWorkerHandler.auth_token = token
     server = ThreadingHTTPServer((host, port), PennyWindowsWorkerHandler)
+    if keep_open:
+        # RAM on a small VM: SAP2000 open in working hours, AutoCAD on demand.
+        app_keeper.Keeper([
+            sap2000_engine.reap_idle_sap2000,
+            lambda: sap2000_engine.prewarm_sap2000(visible=visible),
+            autocad_engine.reap_idle_autocad,
+        ]).start()
     dwg_status = autocad_engine.get_dwg_engine_status()
     print(
         f"Penny Windows Worker listening on http://{host}:{port} "
@@ -269,7 +279,11 @@ if __name__ == "__main__":
     parser.add_argument("--host", default=os.getenv("WORKER_HOST", os.getenv("SAP2000_WORKER_HOST", "0.0.0.0")))
     parser.add_argument("--port", type=int, default=int(os.getenv("WORKER_PORT", os.getenv("SAP2000_WORKER_PORT", "8085"))))
     parser.add_argument("--headless", action="store_true", help="Start SAP2000/AutoCAD with visible=False")
-    parser.add_argument("--keep-open", action="store_true", help="Keep SAP2000 process warm between requests")
+    # SAP2000 / AutoCAD stay open between jobs by default: starting them takes far
+    # longer than the analysis or title-block edit itself.
+    parser.add_argument("--keep-open", action="store_true", help="(default) keep SAP2000 / AutoCAD warm between requests")
+    parser.add_argument("--close-after", action="store_true",
+                        help="Close SAP2000 / AutoCAD after every request (old behaviour)")
     parser.add_argument("--token", default=os.getenv("WORKER_TOKEN", os.getenv("SAP2000_WORKER_TOKEN", "")), help="Optional Bearer token")
     args = parser.parse_args()
 
@@ -278,6 +292,6 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         visible=not args.headless,
-        keep_open=args.keep_open,
+        keep_open=not args.close_after and os.getenv("WORKER_KEEP_OPEN", "1") != "0",
         token=args.token,
     )

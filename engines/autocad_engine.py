@@ -23,15 +23,29 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from engines import app_keeper
 from engines.process_guard import run_with_watchdog
 
 log = logging.getLogger("penny_win_worker.autocad")
 
 AUTOCAD_EXEC_TIMEOUT = int(os.getenv("AUTOCAD_EXEC_TIMEOUT", "180"))
+# Leave AutoCAD running after a job: an ECM package has several DWGs and
+# AutoCAD's start-up dominates each title-block edit otherwise.
+AUTOCAD_KEEP_OPEN = os.getenv("AUTOCAD_KEEP_OPEN", "1") != "0"
+
+
+class _AcadState:
+    """AutoCAD instance this worker started (only that one is ever closed)."""
+    owned = False
+    last_used = 0.0
+
+
+_ACAD_STATE = _AcadState()
 _CAD_LOCK = threading.Lock()
 
 # Default Windows installation paths for ODA File Converter
@@ -235,10 +249,9 @@ def update_dwg_via_autocad_com(
     try:
         try:
             acad = win32com.client.GetActiveObject("AutoCAD.Application")
-            started_new = False
         except Exception:
             acad = win32com.client.Dispatch("AutoCAD.Application")
-            started_new = True
+            _ACAD_STATE.owned = True  # we started it, so we may close it
 
         try:
             acad.Visible = bool(visible)
@@ -248,6 +261,7 @@ def update_dwg_via_autocad_com(
         doc = acad.Documents.Open(str(dwg_path.resolve()))
         modified = False
         tag_to_val = _build_tag_map(fields, field_map)
+        seen_text: list[str] = []
 
         try:
             # Iterate ModelSpace + all PaperSpace Layouts
@@ -269,6 +283,7 @@ def update_dwg_via_autocad_com(
                                 att.TextString = tag_to_val[tag]
                                 att.Update()
                                 modified = True
+                            seen_text.append(str(att.TextString or ""))
 
                     elif obj_name == "AcDbMText":
                         raw_text = str(ent.TextString or "")
@@ -279,6 +294,7 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_text
                             ent.Update()
                             modified = True
+                        seen_text.append(str(ent.TextString or ""))
 
                     elif obj_name == "AcDbText":
                         raw_val = str(ent.TextString or "")
@@ -287,10 +303,20 @@ def update_dwg_via_autocad_com(
                             ent.TextString = new_val
                             ent.Update()
                             modified = True
+                        seen_text.append(str(ent.TextString or ""))
 
             if modified:
+                # Read back what the drawing now says: a template whose text the
+                # rules don't recognise must not pass with a green tick.
+                missing = missing_values_in_text("\n".join(seen_text), fields)
+                if missing:
+                    return (
+                        False,
+                        f"⚠️ AutoCAD edit incomplete — {', '.join(missing[:3])} not found in the "
+                        f"title block; original DWG preserved ({dwg_path.name})",
+                    )
                 doc.Save()
-                return True, f"✅ title block updated natively via AutoCAD COM ({dwg_path.name})"
+                return True, f"✅ title block updated natively in AutoCAD and verified ({dwg_path.name})"
             return (
                 False,
                 f"⚠️ nothing in the title block matched via AutoCAD COM — original DWG preserved ({dwg_path.name})",
@@ -300,11 +326,15 @@ def update_dwg_via_autocad_com(
                 doc.Close(False)
             except Exception:
                 pass
-            if started_new:
+            # Kept open for the rest of the ECM package; app_keeper closes it
+            # after AUTOCAD_IDLE_MIN idle minutes.
+            if _ACAD_STATE.owned and not AUTOCAD_KEEP_OPEN:
                 try:
                     acad.Quit()
+                    _ACAD_STATE.owned = False
                 except Exception:
                     pass
+            _ACAD_STATE.last_used = time.monotonic()
     finally:
         pythoncom.CoUninitialize()
 
@@ -347,6 +377,17 @@ def dxf_to_dwg_oda(dxf_path: Path, out_dir: Path, target_version: str = "ACAD201
         return dwg_candidate
     log.warning(f"ODA DXF->DWG failed (code {code}): {stderr or stdout}")
     return None
+
+
+def missing_values_in_text(text: str, fields: dict[str, str]) -> list[str]:
+    """Field keys whose (cleaned) value does not appear in the drawing's text."""
+    upper = text.upper()
+    missing: list[str] = []
+    for key in ("project_title", "ref_no", "client_name", "contractor_name"):
+        probe = clean_caps(fields.get(key, ""))[:24].strip()
+        if probe and probe not in upper:
+            missing.append(key)
+    return missing
 
 
 def missing_values(dxf_path: Path, fields: dict[str, str]) -> list[str]:
@@ -527,3 +568,36 @@ def update_dwg_title_block(
             timeout_seconds=timeout,
             kill_on_timeout=["acad.exe", "accoreconsole.exe", "ODAFileConverter.exe"],
         )
+
+
+def reap_idle_autocad(now: float | None = None) -> bool:
+    """Quit the worker-started AutoCAD after AUTOCAD_IDLE_MIN idle minutes.
+
+    Never while a drawing is open in it (someone may be working in it)."""
+    if not _ACAD_STATE.owned:
+        return False
+    if app_keeper.idle_for(_ACAD_STATE.last_used, now) < app_keeper.autocad_idle_limit_s():
+        return False
+    if not _CAD_LOCK.acquire(blocking=False):
+        return False
+    try:
+        import pythoncom  # type: ignore[import-not-found]
+        import win32com.client  # type: ignore[import-not-found]
+
+        pythoncom.CoInitialize()
+        try:
+            try:
+                acad = win32com.client.GetActiveObject("AutoCAD.Application")
+            except Exception:
+                _ACAD_STATE.owned = False  # already gone
+                return False
+            if int(acad.Documents.Count) > 0:
+                return False
+            acad.Quit()
+            _ACAD_STATE.owned = False
+            log.info("Closed idle AutoCAD")
+            return True
+        finally:
+            pythoncom.CoUninitialize()
+    finally:
+        _CAD_LOCK.release()

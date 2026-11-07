@@ -130,7 +130,11 @@ class FakeModel:
         # v25 signature: E, U, A, G
         self.PropMaterial = _ns(GetMPIsotropic=lambda nm, e, u, a, g: (0, 2.1e8, 0.3, 1.2e-5, 8.08e7))
         self.File = _ns(OpenFile=lambda p: 0, NewBlank=lambda: 0)
-        self.Analyze = _ns(RunAnalysis=lambda: 0)
+        self.run_flags: dict[str, bool] = {}
+        self.Analyze = _ns(
+            RunAnalysis=lambda: 0,
+            SetRunCaseFlag=lambda nm, run, all_=False: m.run_flags.__setitem__(nm, run) or 0,
+        )
         self.LoadCases = _ns(
             GetNameList=lambda n, a: (0, len(m.cases), list(m.cases)),
             # Real OAPI: (ret, CaseType, SubType). Modal = 3.

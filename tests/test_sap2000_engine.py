@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import sys
 import tempfile
 import unittest
@@ -143,6 +142,13 @@ class TestNewBehaviour(unittest.TestCase):
         self.assertEqual(res["inputs"]["deflection_criteria"], "Not checked")
         res, _ = self._run(deflection="yes")
         self.assertTrue(any("Deflection" in c["name"] for c in res["checks"]))
+
+    def test_modal_not_solved_and_timings_reported(self):
+        res, sap = self._run()
+        self.assertEqual(res["skipped_cases"], ["MODAL"])
+        self.assertEqual(sap.model.run_flags, {"MODAL": False})
+        for k in ("attach_sap2000", "open_model", "analysis", "results", "steel_design", "views", "total"):
+            self.assertIn(k, res["timings"])
 
     def test_auto_design_combos_shown_as_formula(self):
         res, _ = self._run()
