@@ -249,11 +249,9 @@ def update_dwg_via_autocad_com(
     try:
         try:
             acad = win32com.client.GetActiveObject("AutoCAD.Application")
-            started_new = False
         except Exception:
             acad = win32com.client.Dispatch("AutoCAD.Application")
-            started_new = True
-            _ACAD_STATE.owned = True
+            _ACAD_STATE.owned = True  # we started it, so we may close it
 
         try:
             acad.Visible = bool(visible)
