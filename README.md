@@ -49,6 +49,13 @@ Because both SAP2000 OAPI and AutoCAD COM require an interactive GUI session (an
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\register_task.ps1
 ```
+### 4. Update and Restart
+After `main` changes, pull and restart in one go (waits for the old run to end, then checks `/health`):
+```powershell
+.\scripts\restart_worker.ps1          # add -NoPull to restart without pulling
+```
+If PowerShell blocks scripts: `powershell -ExecutionPolicy Bypass -File .\scripts\restart_worker.ps1`.
+
 > **Tip when using Remote Desktop (RDP):** Always disconnect from the Windows VM by running `scripts\disconnect_rdp_keep_gui.bat` as Administrator instead of clicking the RDP close (`X`) button. This hands the session back to the local console (`tscon`) so the GUI surface remains active for SAP2000 and AutoCAD.
 
 ---
