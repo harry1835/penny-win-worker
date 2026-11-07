@@ -53,10 +53,24 @@ class _Doc:
         self.closed_with = save
 
 
+class _ComError(Exception):
+    def __init__(self, hresult, msg):
+        super().__init__(hresult, msg)
+        self.hresult = hresult
+
+
 class TestAutoCADCom(unittest.TestCase):
-    def _run(self, ents):
+    def _run(self, ents, busy_opens=0):
         doc = _Doc(ents)
-        acad = types.SimpleNamespace(Visible=False, Documents=types.SimpleNamespace(Open=lambda p: doc))
+        calls = {"open": 0}
+
+        def open_(p):
+            calls["open"] += 1
+            if calls["open"] <= busy_opens:  # AutoCAD still starting: "call was rejected"
+                raise _ComError(-2147418111, "Call was rejected by callee.")
+            return doc
+        acad = types.SimpleNamespace(Visible=False, Documents=types.SimpleNamespace(Open=open_))
+        acad.open_calls = calls
         acad.quit_called = False
 
         def quit_():
@@ -98,6 +112,27 @@ class TestAutoCADCom(unittest.TestCase):
         self.assertIn("ref_no", msg)
         self.assertFalse(doc.saved)
         self.assertFalse(doc.closed_with)
+
+
+class TestBusyRetry(TestAutoCADCom):
+    def test_busy_autocad_is_retried_not_abandoned(self):
+        with patch.object(autocad_engine.time, "sleep", lambda s: None):
+            ok, msg, doc, acad = self._run([
+                _Ent("AcDbMText", "PROPOSED ERECTION OF SOMETHING", 300),
+                _Ent("AcDbText", "A2311-00029"),
+            ], busy_opens=3)
+        self.assertTrue(ok, msg)
+        self.assertEqual(acad.open_calls["open"], 4)
+
+    def test_other_errors_are_not_retried(self):
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise _ComError(-2147352567, "Exception occurred.")
+        with self.assertRaises(_ComError):
+            autocad_engine._com_retry(boom)
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

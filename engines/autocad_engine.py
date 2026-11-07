@@ -33,7 +33,8 @@ from engines.process_guard import run_with_watchdog
 
 log = logging.getLogger("penny_win_worker.autocad")
 
-AUTOCAD_EXEC_TIMEOUT = int(os.getenv("AUTOCAD_EXEC_TIMEOUT", "180"))
+# Cold AutoCAD start on a small VM can take minutes; the watchdog must outlast it.
+AUTOCAD_EXEC_TIMEOUT = int(os.getenv("AUTOCAD_EXEC_TIMEOUT", "420"))
 # Leave AutoCAD running after a job: an ECM package has several DWGs and
 # AutoCAD's start-up dominates each title-block edit otherwise.
 AUTOCAD_KEEP_OPEN = os.getenv("AUTOCAD_KEEP_OPEN", "1") != "0"
@@ -235,6 +236,76 @@ def _transform_text_string(val: str, fields: dict[str, str]) -> tuple[bool, str]
 
 # ── Tier 1: Native AutoCAD COM Automation (Windows) ─────────────────────────
 
+# AutoCAD answers "busy, call back later" while it is starting or regenerating.
+# Without handling, the first call after a cold start fails with
+# RPC_E_CALL_REJECTED / RPC_E_SERVERCALL_RETRYLATER and the edit is abandoned.
+_RETRY_HRESULTS = {-2147418111, -2147417846}  # RPC_E_CALL_REJECTED, RPC_E_SERVERCALL_RETRYLATER
+AUTOCAD_BUSY_TIMEOUT = float(os.getenv("AUTOCAD_BUSY_TIMEOUT", "150"))
+
+
+def _hresult(e: BaseException) -> Any:
+    hr = getattr(e, "hresult", None)
+    if hr is None and getattr(e, "args", None):
+        hr = e.args[0]
+    return hr
+
+
+def _com_retry(fn: Any, timeout_s: float | None = None) -> Any:
+    """Call fn(), retrying while AutoCAD rejects the call because it is busy."""
+    deadline = time.monotonic() + (AUTOCAD_BUSY_TIMEOUT if timeout_s is None else timeout_s)
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            if _hresult(e) in _RETRY_HRESULTS and time.monotonic() < deadline:
+                time.sleep(0.5)
+                continue
+            raise
+
+
+def _wait_until_idle(acad: Any, timeout_s: float | None = None) -> None:
+    """Wait for AutoCAD to finish starting / opening (GetAcadState().IsQuiescent)."""
+    deadline = time.monotonic() + (AUTOCAD_BUSY_TIMEOUT if timeout_s is None else timeout_s)
+    while time.monotonic() < deadline:
+        try:
+            if acad.GetAcadState().IsQuiescent:
+                return
+        except Exception as e:
+            if _hresult(e) not in _RETRY_HRESULTS:
+                return  # API not available: carry on, _com_retry still covers calls
+        time.sleep(0.5)
+
+
+def _register_busy_message_filter(pythoncom: Any) -> Any:
+    """
+    COM message filter so every call AutoCAD rejects as busy is retried
+    (the documented way to automate AutoCAD from an STA thread). Returns the
+    previous filter, or None if this pywin32 build cannot register one.
+    """
+    try:
+        from win32com.server.util import wrap  # type: ignore[import-not-found]
+
+        class _BusyFilter:
+            _public_methods_ = ["HandleInComingCall", "RetryRejectedCall", "MessagePending"]
+            _com_interfaces_ = [pythoncom.IID_IMessageFilter]
+
+            def HandleInComingCall(self, call_type, caller, tick, info):
+                return 0  # SERVERCALL_ISHANDLED
+
+            def RetryRejectedCall(self, callee, tick, reject_type):
+                if reject_type == 2 and tick < AUTOCAD_BUSY_TIMEOUT * 1000:  # SERVERCALL_RETRYLATER
+                    return 250  # retry in 250 ms
+                return -1
+
+            def MessagePending(self, callee, tick, pending_type):
+                return 2  # PENDINGMSG_WAITDEFPROCESS
+
+        return pythoncom.CoRegisterMessageFilter(wrap(_BusyFilter(), pythoncom.IID_IMessageFilter))
+    except Exception as e:
+        log.debug(f"COM message filter not registered: {e}")
+        return None
+
+
 def update_dwg_via_autocad_com(
     dwg_path: Path,
     fields: dict[str, str],
@@ -246,19 +317,22 @@ def update_dwg_via_autocad_com(
     import win32com.client  # type: ignore[import-not-found]
 
     pythoncom.CoInitialize()
+    _register_busy_message_filter(pythoncom)
     try:
         try:
             acad = win32com.client.GetActiveObject("AutoCAD.Application")
         except Exception:
-            acad = win32com.client.Dispatch("AutoCAD.Application")
+            acad = _com_retry(lambda: win32com.client.Dispatch("AutoCAD.Application"))
             _ACAD_STATE.owned = True  # we started it, so we may close it
+        _wait_until_idle(acad)
 
         try:
-            acad.Visible = bool(visible)
+            _com_retry(lambda: setattr(acad, "Visible", bool(visible)))
         except Exception:
             pass
 
-        doc = acad.Documents.Open(str(dwg_path.resolve()))
+        doc = _com_retry(lambda: acad.Documents.Open(str(dwg_path.resolve())))
+        _wait_until_idle(acad)
         modified = False
         tag_to_val = _build_tag_map(fields, field_map)
         seen_text: list[str] = []
@@ -315,7 +389,7 @@ def update_dwg_via_autocad_com(
                         f"⚠️ AutoCAD edit incomplete — {', '.join(missing[:3])} not found in the "
                         f"title block; original DWG preserved ({dwg_path.name})",
                     )
-                doc.Save()
+                _com_retry(doc.Save)
                 return True, f"✅ title block updated natively in AutoCAD and verified ({dwg_path.name})"
             return (
                 False,
@@ -471,21 +545,23 @@ def _update_dwg_title_block_inner(
         return False, f"⚠️ DWG file not found: {dwg_path.name}", None, "none"
 
     # Tier 1: Try native AutoCAD COM if available on Windows
+    com_error = ""
     if is_autocad_com_available():
         try:
             ok, msg = update_dwg_via_autocad_com(dwg_path, fields, field_map)
             return ok, msg, dwg_path, "autocad_com"
         except Exception as e:
-            log.warning(f"AutoCAD COM failed ({e}), falling back to ODA+ezdxf...")
+            com_error = f"{type(e).__name__}: {e}"
+            log.warning(f"AutoCAD COM failed on {dwg_path.name} ({com_error}), falling back to ODA+ezdxf...")
 
     # Tier 2: ODA File Converter + ezdxf
     if not find_oda_executable():
-        return (
-            False,
-            "⚠️ untouched (neither AutoCAD COM nor ODA File Converter installed on worker)",
-            dwg_path,
-            "none",
+        reason = (
+            f"AutoCAD COM failed ({com_error[:160]}) and no ODA File Converter on worker"
+            if com_error else
+            "AutoCAD.Application is not registered and no ODA File Converter on worker"
         )
+        return False, f"⚠️ untouched ({reason})", dwg_path, "none"
 
     with tempfile.TemporaryDirectory(prefix="penny_oda_") as tmpdir:
         tmp = Path(tmpdir)

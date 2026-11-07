@@ -1,5 +1,5 @@
 # ============================================================================
-# restart_worker.ps1 — Update and restart the Penny Windows worker
+# restart_worker.ps1 - Update and restart the Penny Windows worker
 # ============================================================================
 # Pulls the latest code, stops the running worker, waits for the scheduled
 # task to finish (starting it while the old run is still "Running" is silently
@@ -55,7 +55,7 @@ if ($null -eq $health) {
 
 $health | Select-Object commit_running, restart_needed, work_hours_now, sap2000_held_open, autocad_held_open, dwg_engine | Format-List
 if ($health.restart_needed) {
-    Write-Host "Running commit differs from the checkout — restart again." -ForegroundColor Yellow
+    Write-Host "Running commit differs from the checkout - restart again." -ForegroundColor Yellow
     exit 1
 }
 Write-Host "Worker is up." -ForegroundColor Green

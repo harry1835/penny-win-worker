@@ -1,5 +1,5 @@
 # ============================================================================
-# register_task.ps1 — Register Penny Windows Worker in Windows Task Scheduler
+# register_task.ps1 - Register Penny Windows Worker in Windows Task Scheduler
 # ============================================================================
 # IMPORTANT: Both AutoCAD COM and SAP2000 OAPI require an interactive user
 # session (LogonType Interactive) rather than a headless Session 0 Windows
