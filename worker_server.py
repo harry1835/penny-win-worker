@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from engines import autocad_engine, sap2000_engine
+from engines import app_keeper, autocad_engine, sap2000_engine
 
 
 def _git_commit() -> str:
@@ -104,6 +104,9 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
                 "commit_running": _RUNNING_COMMIT,
                 "commit_on_disk": _git_commit(),
                 "restart_needed": _RUNNING_COMMIT != _git_commit(),
+                "work_hours_now": app_keeper.in_work_hours(),
+                "sap2000_held_open": sap2000_engine._SAP_STATE.owned,
+                "autocad_held_open": autocad_engine._ACAD_STATE.owned,
                 **dwg_info,
             })
             return
@@ -254,6 +257,13 @@ def serve_worker(
     PennyWindowsWorkerHandler.keep_open = keep_open
     PennyWindowsWorkerHandler.auth_token = token
     server = ThreadingHTTPServer((host, port), PennyWindowsWorkerHandler)
+    if keep_open:
+        # RAM on a small VM: SAP2000 open in working hours, AutoCAD on demand.
+        app_keeper.Keeper([
+            sap2000_engine.reap_idle_sap2000,
+            lambda: sap2000_engine.prewarm_sap2000(visible=visible),
+            autocad_engine.reap_idle_autocad,
+        ]).start()
     dwg_status = autocad_engine.get_dwg_engine_status()
     print(
         f"Penny Windows Worker listening on http://{host}:{port} "

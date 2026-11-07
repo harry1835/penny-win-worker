@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from engines import sap2000_post
+from engines import app_keeper, sap2000_post
 from engines.process_guard import run_with_watchdog
 
 log = logging.getLogger("penny_win_worker.sap2000")
@@ -36,6 +36,15 @@ _NEEDS_MODAL_TYPES = {4, 5, 7, 11, 12}
 
 # Serialize SAP2000 OAPI calls so concurrent requests never clobber COM state
 _SAP_LOCK = threading.Lock()
+
+
+class _SapState:
+    """SAP2000 instance this worker started (only that one is ever closed)."""
+    owned = False
+    last_used = 0.0
+
+
+_SAP_STATE = _SapState()
 
 
 def is_sap2000_available() -> bool:
@@ -651,10 +660,12 @@ def _analyze_sap2000_model_inner(
             attached = True
             if sap_obj is None:
                 attached = False
+                _SAP_STATE.owned = False
                 sap_obj = helper_iface.CreateObjectProgID("CSI.SAP2000.API.SapObject")
                 ret = sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible)
                 if ret != 0:
                     raise RuntimeError(f"SAP2000 ApplicationStart failed with code {ret}")
+                _SAP_STATE.owned = True
             stamp("start_sap2000" if not attached else "attach_sap2000")
 
             try:
@@ -1003,16 +1014,21 @@ def _analyze_sap2000_model_inner(
 
                 stamp("views")
             finally:
-                if not attached and not keep_open:
+                # Kept open: app_keeper closes our instance once it has been idle
+                # long enough outside working hours. Someone else's instance is
+                # never closed — only cleared of the job model.
+                if not keep_open and (not attached or _SAP_STATE.owned):
                     try:
                         sap_obj.ApplicationExit(False)
                     except Exception:
                         pass
+                    _SAP_STATE.owned = False
                 else:
                     try:
                         model.File.NewBlank()
                     except Exception:
                         pass
+                _SAP_STATE.last_used = time.monotonic()
     finally:
         _uninit_com_thread()
     stamp("close")
@@ -1143,6 +1159,59 @@ def _analyze_sap2000_model_inner(
     }
     _apply_combo_labels(res, combo_labels)
     return res
+
+
+def reap_idle_sap2000(now: float | None = None) -> bool:
+    """Close the worker-started SAP2000 when idle past the limit (off hours only)."""
+    limit = app_keeper.sap2000_idle_limit_s()
+    if not _SAP_STATE.owned or limit is None:
+        return False
+    if app_keeper.idle_for(_SAP_STATE.last_used, now) < limit:
+        return False
+    if not _SAP_LOCK.acquire(blocking=False):  # a job is running
+        return False
+    try:
+        _init_com_thread()
+        try:
+            sap = _load_sap_module()
+            sap_obj = sap.cHelper(sap.Helper()).GetObject("CSI.SAP2000.API.SapObject")
+            if sap_obj is not None:
+                sap_obj.ApplicationExit(False)
+                log.info("Closed idle SAP2000 (outside working hours)")
+        finally:
+            _uninit_com_thread()
+        _SAP_STATE.owned = False
+        return True
+    finally:
+        _SAP_LOCK.release()
+
+
+def prewarm_sap2000(visible: bool = True) -> bool:
+    """Start SAP2000 during working hours so the day's first job does not wait for it."""
+    if not (app_keeper.sap2000_prewarm_enabled() and app_keeper.in_work_hours()):
+        return False
+    if _SAP_STATE.owned or not is_sap2000_available():
+        return False
+    if not _SAP_LOCK.acquire(blocking=False):
+        return False
+    try:
+        _init_com_thread()
+        try:
+            sap = _load_sap_module()
+            helper_iface = sap.cHelper(sap.Helper())
+            if helper_iface.GetObject("CSI.SAP2000.API.SapObject") is not None:
+                return False  # already running (someone's session or a previous worker)
+            sap_obj = helper_iface.CreateObjectProgID("CSI.SAP2000.API.SapObject")
+            if sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible) != 0:
+                return False
+            _SAP_STATE.owned = True
+            _SAP_STATE.last_used = time.monotonic()
+            log.info("Pre-started SAP2000 for working hours")
+            return True
+        finally:
+            _uninit_com_thread()
+    finally:
+        _SAP_LOCK.release()
 
 
 def analyze_sap2000_model(

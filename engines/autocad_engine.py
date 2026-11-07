@@ -23,10 +23,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from engines import app_keeper
 from engines.process_guard import run_with_watchdog
 
 log = logging.getLogger("penny_win_worker.autocad")
@@ -35,6 +37,15 @@ AUTOCAD_EXEC_TIMEOUT = int(os.getenv("AUTOCAD_EXEC_TIMEOUT", "180"))
 # Leave AutoCAD running after a job: an ECM package has several DWGs and
 # AutoCAD's start-up dominates each title-block edit otherwise.
 AUTOCAD_KEEP_OPEN = os.getenv("AUTOCAD_KEEP_OPEN", "1") != "0"
+
+
+class _AcadState:
+    """AutoCAD instance this worker started (only that one is ever closed)."""
+    owned = False
+    last_used = 0.0
+
+
+_ACAD_STATE = _AcadState()
 _CAD_LOCK = threading.Lock()
 
 # Default Windows installation paths for ODA File Converter
@@ -242,6 +253,7 @@ def update_dwg_via_autocad_com(
         except Exception:
             acad = win32com.client.Dispatch("AutoCAD.Application")
             started_new = True
+            _ACAD_STATE.owned = True
 
         try:
             acad.Visible = bool(visible)
@@ -316,11 +328,15 @@ def update_dwg_via_autocad_com(
                 doc.Close(False)
             except Exception:
                 pass
-            if started_new and not AUTOCAD_KEEP_OPEN:
+            # Kept open for the rest of the ECM package; app_keeper closes it
+            # after AUTOCAD_IDLE_MIN idle minutes.
+            if _ACAD_STATE.owned and not AUTOCAD_KEEP_OPEN:
                 try:
                     acad.Quit()
+                    _ACAD_STATE.owned = False
                 except Exception:
                     pass
+            _ACAD_STATE.last_used = time.monotonic()
     finally:
         pythoncom.CoUninitialize()
 
@@ -554,3 +570,36 @@ def update_dwg_title_block(
             timeout_seconds=timeout,
             kill_on_timeout=["acad.exe", "accoreconsole.exe", "ODAFileConverter.exe"],
         )
+
+
+def reap_idle_autocad(now: float | None = None) -> bool:
+    """Quit the worker-started AutoCAD after AUTOCAD_IDLE_MIN idle minutes.
+
+    Never while a drawing is open in it (someone may be working in it)."""
+    if not _ACAD_STATE.owned:
+        return False
+    if app_keeper.idle_for(_ACAD_STATE.last_used, now) < app_keeper.autocad_idle_limit_s():
+        return False
+    if not _CAD_LOCK.acquire(blocking=False):
+        return False
+    try:
+        import pythoncom  # type: ignore[import-not-found]
+        import win32com.client  # type: ignore[import-not-found]
+
+        pythoncom.CoInitialize()
+        try:
+            try:
+                acad = win32com.client.GetActiveObject("AutoCAD.Application")
+            except Exception:
+                _ACAD_STATE.owned = False  # already gone
+                return False
+            if int(acad.Documents.Count) > 0:
+                return False
+            acad.Quit()
+            _ACAD_STATE.owned = False
+            log.info("Closed idle AutoCAD")
+            return True
+        finally:
+            pythoncom.CoUninitialize()
+    finally:
+        _CAD_LOCK.release()
