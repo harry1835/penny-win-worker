@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from engines import sap2000_post
 from engines.process_guard import run_with_watchdog
 
 log = logging.getLogger("penny_win_worker.sap2000")
@@ -65,6 +66,349 @@ def _uninit_com_thread() -> None:
         pythoncom.CoUninitialize()
     except Exception:
         pass
+
+
+# ── OAPI helpers ────────────────────────────────────────────────────────────
+def _names(ret: Any) -> list[str]:
+    """Unpack a (ret, count, names[]) GetNameList tuple."""
+    try:
+        if ret[0] == 0 and len(ret) >= 3 and ret[2]:
+            return [str(n) for n in ret[2]]
+    except Exception:
+        pass
+    return []
+
+
+def _step_key(case: str, step: Any) -> str:
+    """Envelope combos return Max and Min rows; keep them apart."""
+    st = str(step or "").strip()
+    return f"{case} {st}" if st.lower() in ("max", "min") else str(case)
+
+
+def _base_case(key: str) -> str:
+    for suf in (" Max", " Min", " max", " min"):
+        if key.endswith(suf):
+            return key[: -len(suf)]
+    return key
+
+
+def _case_type(model: Any, sap: Any, name: str) -> Any:
+    """OAPI load case type (eLoadCaseType), or None if it can't be read."""
+    try:
+        r = model.LoadCases.GetTypeOAPI(name, sap.eLoadCaseType.LinearStatic, 0)
+        if r[0] == 0:
+            return r[1]
+    except Exception:
+        pass
+    return None
+
+
+def _select_for_output(model: Any, name: str, combos: list[str]) -> None:
+    model.Results.Setup.DeselectAllCasesAndCombosForOutput()
+    if name in combos:
+        model.Results.Setup.SetComboSelectedForOutput(name)
+    else:
+        model.Results.Setup.SetCaseSelectedForOutput(name)
+
+
+def _program_version(model: Any) -> str:
+    try:
+        r = model.GetVersion("", 0.0)
+        if r[0] == 0 and r[1]:
+            return str(r[1])
+    except Exception:
+        pass
+    return "25"
+
+
+def _design_code(model: Any) -> str:
+    try:
+        r = model.DesignSteel.GetCode("")
+        if r[0] == 0:
+            return str(r[1])
+    except Exception:
+        pass
+    return ""
+
+
+def _read_geometry(model: Any, frame_names: list[str], frame_sections: dict[str, str]) -> dict[str, Any]:
+    joints: dict[str, list[float]] = {}
+    restraints: dict[str, list[bool]] = {}
+    for pname in _names(model.PointObj.GetNameList(0, [])):
+        try:
+            r = model.PointObj.GetCoordCartesian(pname, 0.0, 0.0, 0.0, "Global")
+            if r[0] == 0:
+                joints[pname] = [float(r[1]), float(r[2]), float(r[3])]
+        except Exception:
+            continue
+        try:
+            rr = model.PointObj.GetRestraint(pname, [False] * 6)
+            if rr[0] == 0:
+                vals = [bool(v) for v in rr[1]]
+                if any(vals):
+                    restraints[pname] = vals
+        except Exception:
+            pass
+    frames: list[dict[str, Any]] = []
+    for fname in frame_names:
+        try:
+            r = model.FrameObj.GetPoints(fname, "", "")
+            if r[0] != 0:
+                continue
+            angle = 0.0
+            try:
+                la = model.FrameObj.GetLocalAxes(fname, 0.0, False)
+                if la[0] == 0:
+                    angle = float(la[1])
+            except Exception:
+                pass
+            frames.append({
+                "name": fname,
+                "i": str(r[1]),
+                "j": str(r[2]),
+                "section": frame_sections.get(fname, ""),
+                "angle": angle,
+            })
+        except Exception:
+            continue
+    return {"joints": joints, "restraints": restraints, "frames": frames}
+
+
+def _read_stiffness(model: Any, frame_names: list[str], frame_sections: dict[str, str]) -> dict[str, tuple[float, float]]:
+    """(EI22, EI33) per frame in kN·m², including section and object modifiers."""
+    sec_cache: dict[str, tuple[float, float, list[float]]] = {}
+    out: dict[str, tuple[float, float]] = {}
+    for fname in frame_names:
+        sec = frame_sections.get(fname)
+        if not sec:
+            continue
+        if sec not in sec_cache:
+            try:
+                sp = model.PropFrame.GetSectProps(sec, *([0.0] * 12))
+                i22, i33 = float(sp[5]), float(sp[6])
+                mat = str(model.PropFrame.GetMaterial(sec, "")[1])
+                E = float(model.PropMaterial.GetMPIsotropic(mat, 0.0, 0.0, 0.0)[1])
+                mods = [1.0] * 8
+                try:
+                    m = model.PropFrame.GetModifiers(sec, [1.0] * 8)
+                    if m[0] == 0:
+                        mods = [float(v) for v in m[1]]
+                except Exception:
+                    pass
+                sec_cache[sec] = (E * i22, E * i33, mods)
+            except Exception:
+                sec_cache[sec] = (0.0, 0.0, [1.0] * 8)
+        ei22, ei33, smods = sec_cache[sec]
+        omods = [1.0] * 8
+        try:
+            m = model.FrameObj.GetModifiers(fname, [1.0] * 8)
+            if m[0] == 0:
+                omods = [float(v) for v in m[1]]
+        except Exception:
+            pass
+        out[fname] = (ei22 * smods[4] * omods[4], ei33 * smods[5] * omods[5])
+    return out
+
+
+def _pick_plot_combo(
+    inputs: dict[str, Any], load_cases: list[str], load_combos: list[str], peak_m3: dict[str, float],
+) -> str:
+    """Combo whose V/M diagrams go in the report: the governing ULS combination."""
+    wanted = str(inputs.get("plot_combo") or "").strip()
+    if wanted and (wanted in load_combos or wanted in load_cases):
+        return wanted
+    uls = [c for c in load_combos if not sap2000_post.is_sls_name(c)]
+    for pool in (uls, load_combos, load_cases):
+        if pool:
+            return max(pool, key=lambda c: peak_m3.get(c, 0.0))
+    return ""
+
+
+def _pick_load_pattern(model: Any, inputs: dict[str, Any]) -> str:
+    """Load pattern drawn on the 'Frame Span Loads' view (LIVE by preference)."""
+    pats = _names(model.LoadPatterns.GetNameList(0, []))
+    wanted = str(inputs.get("load_pattern") or "").strip()
+    if wanted in pats:
+        return wanted
+    for p in pats:
+        u = p.upper()
+        if "LIVE" in u or u in ("LL", "Q", "QK", "IMPOSED"):
+            return p
+    for p in pats:
+        if not any(t in p.upper() for t in ("DEAD", "SDL", "SELF", "SW")):
+            return p
+    return pats[0] if pats else ""
+
+
+def _pick_deflection_case(
+    inputs: dict[str, Any], load_cases: list[str], load_pattern: str,
+    disp_by_case: dict[str, dict[str, tuple[float, float, float]]],
+) -> str:
+    wanted = str(inputs.get("deflection_case") or "").strip()
+    if wanted:
+        return wanted
+    if load_pattern in load_cases:
+        return load_pattern
+
+    def peak(key: str) -> float:
+        return max((max(abs(c) for c in d) for d in disp_by_case.get(key, {}).values()), default=0.0)
+
+    pool = [k for k in disp_by_case if _base_case(k) in load_cases]
+    if pool:
+        return _base_case(max(pool, key=peak))
+    return load_cases[0] if load_cases else ""
+
+
+def _collect_views(
+    model: Any, sap: Any, geometry: dict[str, Any], plot_combo: str, deflection_case: str,
+    load_pattern: str, load_combos: list[str], steel_design_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    views: dict[str, Any] = {
+        "joints": geometry["joints"],
+        "restraints": geometry["restraints"],
+        "frames": geometry["frames"],
+        "plot_combo": plot_combo,
+        "deflection_case": deflection_case,
+        "load_pattern": load_pattern,
+    }
+
+    # Frame forces along each member for the plotted combo (Max/Min if envelope)
+    frame_forces: dict[str, dict[str, Any]] = {}
+    reactions: dict[str, list[float]] = {}
+    if plot_combo:
+        _select_for_output(model, plot_combo, load_combos)
+        rf = model.Results.FrameForce(
+            "ALL", sap.eItemTypeElm.GroupElm,
+            0, [], [], [], [], [], [], [], [], [], [], [], [], []
+        )
+        n = int(rf[1]) if rf[0] == 0 else 0
+        tmp: dict[str, dict[float, dict[str, float]]] = {}
+        for i in range(n):
+            fname = str(rf[2][i])
+            sta = round(float(rf[3][i]), 6)
+            rec = tmp.setdefault(fname, {}).setdefault(sta, {})
+            for comp, idx in (("P", 9), ("V2", 10), ("V3", 11), ("T", 12), ("M2", 13), ("M3", 14)):
+                v = float(rf[idx][i])
+                rec[f"{comp}_max"] = max(rec.get(f"{comp}_max", v), v)
+                rec[f"{comp}_min"] = min(rec.get(f"{comp}_min", v), v)
+        for fname, by_sta in tmp.items():
+            stas = sorted(by_sta)
+            entry: dict[str, Any] = {"sta": stas}
+            for comp in ("P", "V2", "M3"):
+                for ext in ("max", "min"):
+                    entry[f"{comp}_{ext}"] = [round(by_sta[s][f"{comp}_{ext}"], 5) for s in stas]
+            frame_forces[fname] = entry
+
+        rr = model.Results.JointReact(
+            "ALL", sap.eItemTypeElm.GroupElm,
+            0, [], [], [], [], [], [], [], [], [], [], []
+        )
+        n = int(rr[1]) if rr[0] == 0 else 0
+        for i in range(n):
+            jn = str(rr[2][i])
+            vals = [float(rr[k][i]) for k in range(7, 13)]
+            prev = reactions.get(jn)
+            if prev is None:
+                reactions[jn] = vals
+            else:
+                reactions[jn] = [v if abs(v) > abs(p) else p for v, p in zip(vals, prev)]
+    views["frame_forces"] = frame_forces
+    views["reactions"] = {k: [round(v, 4) for v in vals] for k, vals in reactions.items()}
+
+    # Joint displacements + rotations for the deformed shape
+    joint_displ: dict[str, list[float]] = {}
+    if deflection_case:
+        _select_for_output(model, deflection_case, load_combos)
+        rd = model.Results.JointDispl(
+            "ALL", sap.eItemTypeElm.GroupElm,
+            0, [], [], [], [], [], [], [], [], [], [], []
+        )
+        n = int(rd[1]) if rd[0] == 0 else 0
+        for i in range(n):
+            jn = str(rd[2][i])
+            vals = [float(rd[k][i]) for k in range(7, 13)]
+            mag = sum(v * v for v in vals[:3])
+            prev = joint_displ.get(jn)
+            if prev is None or mag > sum(v * v for v in prev[:3]):
+                joint_displ[jn] = vals
+    views["joint_displ"] = {k: [float(f"{v:.6g}") for v in vals] for k, vals in joint_displ.items()}
+
+    # Applied loads of one pattern ("Frame Span Loads (LIVE)")
+    loads: dict[str, list[dict[str, Any]]] = {"frame_dist": [], "frame_point": [], "joint": []}
+    if load_pattern:
+        try:
+            r = model.FrameObj.GetLoadDistributed(
+                "ALL", 0, [], [], [], [], [], [], [], [], [], [], [], sap.eItemType.Group
+            )
+            if r[0] == 0:
+                for i in range(int(r[1])):
+                    if str(r[3][i]) != load_pattern or int(r[4][i]) != 1:
+                        continue
+                    loads["frame_dist"].append({
+                        "frame": str(r[2][i]), "csys": str(r[5][i]), "dir": int(r[6][i]),
+                        "rd1": float(r[7][i]), "rd2": float(r[8][i]),
+                        "val1": float(r[11][i]), "val2": float(r[12][i]),
+                    })
+        except Exception as e:
+            log.debug(f"GetLoadDistributed failed: {e}")
+        try:
+            r = model.FrameObj.GetLoadPoint(
+                "ALL", 0, [], [], [], [], [], [], [], [], sap.eItemType.Group
+            )
+            if r[0] == 0:
+                for i in range(int(r[1])):
+                    if str(r[3][i]) != load_pattern or int(r[4][i]) != 1:
+                        continue
+                    loads["frame_point"].append({
+                        "frame": str(r[2][i]), "csys": str(r[5][i]), "dir": int(r[6][i]),
+                        "rd": float(r[7][i]), "val": float(r[9][i]),
+                    })
+        except Exception as e:
+            log.debug(f"GetLoadPoint failed: {e}")
+        try:
+            r = model.PointObj.GetLoadForce(
+                "ALL", 0, [], [], [], [], [], [], [], [], [], [], sap.eItemType.Group
+            )
+            if r[0] == 0:
+                for i in range(int(r[1])):
+                    if str(r[3][i]) != load_pattern:
+                        continue
+                    loads["joint"].append({
+                        "joint": str(r[2][i]),
+                        "F": [float(r[6][i]), float(r[7][i]), float(r[8][i])],
+                    })
+        except Exception as e:
+            log.debug(f"GetLoadForce failed: {e}")
+    views["loads"] = loads
+
+    views["stress_ratios"] = {d["frame"]: d["ratio"] for d in steel_design_results}
+    return views
+
+
+def _member_deflections(
+    inputs: dict[str, Any], geometry: dict[str, Any], load_cases: list[str], load_combos: list[str],
+    disp_by_case: dict[str, dict[str, tuple[float, float, float]]],
+    moments_by_case: dict[str, dict[str, dict[str, list[float]]]],
+    stiffness: dict[str, tuple[float, float]],
+) -> list[dict[str, Any]]:
+    wanted = inputs.get("deflection_cases")
+    if isinstance(wanted, str):
+        wanted = [w.strip() for w in wanted.split(",") if w.strip()]
+    if wanted:
+        bases = set(wanted)
+    else:
+        bases = set(load_cases) | {c for c in load_combos if sap2000_post.is_sls_name(c)}
+    sets = {k: v for k, v in disp_by_case.items() if _base_case(k) in bases}
+    joints = {k: tuple(v) for k, v in geometry["joints"].items()}
+    frames = geometry["frames"]
+    chains = sap2000_post.build_member_chains(joints, frames, geometry["restraints"].keys())
+    return sap2000_post.chain_deflection_checks(
+        chains, joints, {f["name"]: f for f in frames}, sets,
+        {k: v for k, v in moments_by_case.items() if k in sets},
+        stiffness,
+        span_ratio=float(inputs.get("deflection_span_ratio") or 200.0),
+        cantilever_ratio=float(inputs.get("cantilever_span_ratio") or 180.0),
+    )
 
 
 def _analyze_sap2000_model_inner(
@@ -119,6 +463,23 @@ def _analyze_sap2000_model_inner(
                     if sec_res[0] == 0 and len(sec_res) >= 2:
                         frame_sections[fname] = str(sec_res[1])
 
+                # Model geometry for the SAP2000-style report views
+                geometry = _read_geometry(model, frame_names, frame_sections)
+
+                # Denser output stations give smooth V/M diagrams and an accurate
+                # member-sag integration (analysis runs on a temp copy of the model).
+                n_sta = int(inputs.get("output_stations", 11) or 0)
+                if n_sta > 0:
+                    try:
+                        model.SetModelIsLocked(False)
+                    except Exception:
+                        pass
+                    for fname in frame_names:
+                        try:
+                            model.FrameObj.SetOutputStations(fname, 2, 0.0, n_sta, False, False)
+                        except Exception:
+                            break
+
                 # Run structural analysis
                 ret = model.Analyze.RunAnalysis()
                 if ret != 0:
@@ -128,14 +489,15 @@ def _analyze_sap2000_model_inner(
                 ret_lcases = model.LoadCases.GetNameList(0, [])
                 all_lcases = list(ret_lcases[2]) if (len(ret_lcases) >= 3 and ret_lcases[2]) else []
 
-                # CRITICAL: Filter out non-physical eigenmode cases (e.g. MODAL, BUCKLING).
-                # Modal cases contain arbitrary mass-normalized eigenvectors that can produce
-                # pseudo-displacements and pseudo-forces in the millions of kN / mm, corrupting
-                # the governing engineering envelopes.
+                # CRITICAL: drop non-physical eigen cases (Modal / Buckling). Their results
+                # are mass-normalised mode shapes, not responses to load, and produce
+                # pseudo-forces and displacements in the millions. Classified by OAPI case
+                # type, so a modal case named e.g. "MODES" or "EQ-Ritz" is also excluded.
                 load_cases = [
                     lc for lc in all_lcases
-                    if not any(token in lc.upper() for token in ("MODAL", "BUCKL", "EIGEN"))
+                    if not sap2000_post.is_non_physical_case(lc, _case_type(model, sap, lc))
                 ]
+                excluded_cases = [lc for lc in all_lcases if lc not in load_cases]
 
                 ret_combos = model.RespCombo.GetNameList(0, [])
                 load_combos = list(ret_combos[2]) if (len(ret_combos) >= 3 and ret_combos[2]) else []
@@ -161,6 +523,7 @@ def _analyze_sap2000_model_inner(
                 gov_disp_case = "–"
 
                 joint_disp_map: dict[str, dict[str, Any]] = {}
+                disp_by_case: dict[str, dict[str, tuple[float, float, float]]] = {}
                 for i in range(n_displ):
                     j_name = str(res_displ[2][i])
                     lc_name = str(res_displ[4][i])
@@ -168,6 +531,9 @@ def _analyze_sap2000_model_inner(
                     u2_mm = float(res_displ[8][i]) * 1000.0
                     u3_mm = float(res_displ[9][i]) * 1000.0
                     mag_mm = max(abs(u1_mm), abs(u2_mm), abs(u3_mm))
+                    disp_by_case.setdefault(_step_key(lc_name, res_displ[5][i]), {})[j_name] = (
+                        u1_mm / 1000.0, u2_mm / 1000.0, u3_mm / 1000.0,
+                    )
 
                     if abs(u1_mm) > abs(max_u1_mm):
                         max_u1_mm = u1_mm
@@ -265,6 +631,8 @@ def _analyze_sap2000_model_inner(
                 max_m3 = 0.0
 
                 member_env_map: dict[str, dict[str, Any]] = {}
+                moments_by_case: dict[str, dict[str, dict[str, list[float]]]] = {}
+                lc_peak_m3: dict[str, float] = {}
                 for i in range(n_frame):
                     f_name = str(res_frame[2][i])
                     lc_name = str(res_frame[6][i])
@@ -274,6 +642,15 @@ def _analyze_sap2000_model_inner(
                     t = float(res_frame[12][i])
                     m2 = float(res_frame[13][i])
                     m3 = float(res_frame[14][i])
+
+                    key = _step_key(lc_name, res_frame[7][i])
+                    mom = moments_by_case.setdefault(key, {}).setdefault(
+                        f_name, {"sta": [], "M2": [], "M3": []}
+                    )
+                    mom["sta"].append(float(res_frame[3][i]))
+                    mom["M2"].append(m2)
+                    mom["M3"].append(m3)
+                    lc_peak_m3[lc_name] = max(lc_peak_m3.get(lc_name, 0.0), abs(m3))
 
                     if abs(p) > abs(max_p):
                         max_p = p
@@ -361,6 +738,40 @@ def _analyze_sap2000_model_inner(
                     except Exception as e:
                         log.debug(f"DesignSteel skipped or not configured in model: {e}")
 
+                # ── 5. Data for the SAP2000-style views + member deflection ────
+                plot_combo = _pick_plot_combo(inputs, load_cases, load_combos, lc_peak_m3)
+                load_pattern = _pick_load_pattern(model, inputs)
+                deflection_case = _pick_deflection_case(inputs, load_cases, load_pattern, disp_by_case)
+                stiffness = _read_stiffness(model, frame_names, frame_sections)
+                views: dict[str, Any] = {}
+                if inputs.get("views", True):
+                    try:
+                        views = _collect_views(
+                            model, sap, geometry, plot_combo, deflection_case, load_pattern,
+                            load_combos, steel_design_results,
+                        )
+                    except Exception as e:  # views must never break the analysis
+                        log.warning(f"SAP2000 view data collection failed: {e}")
+                        views = {"error": str(e)}
+                    dm = moments_by_case.get(deflection_case) or {}
+                    views["deflection_moments"] = {
+                        f: {k: [round(x, 6) for x in v] for k, v in d.items()} for f, d in dm.items()
+                    }
+                    views["stiffness"] = {f: [round(a, 3), round(b, 3)] for f, (a, b) in stiffness.items()}
+                    if inputs.get("view_plan") is not None or inputs.get("view_elev") is not None:
+                        views["view"] = {
+                            "plan": float(inputs.get("view_plan", 315.0)),
+                            "elev": float(inputs.get("view_elev", 35.0)),
+                        }
+                    views.update({
+                        "program": "SAP2000",
+                        "version": _program_version(model),
+                        "model_file": src_path.name,
+                        "units": "KN, m, C",
+                    })
+                    if steel_design_results:
+                        views["design_code"] = sap2000_post.friendly_design_code(_design_code(model))
+
             finally:
                 if not attached and not keep_open:
                     try:
@@ -376,7 +787,8 @@ def _analyze_sap2000_model_inner(
         _uninit_com_thread()
 
     # ── 5. Build Engineering Checks ─────────────────────────────────────────
-    disp_limit_mm = float(inputs.get("deflection_limit_mm") or 25.0)
+    explicit_disp_limit = bool(inputs.get("deflection_limit_mm"))
+    disp_limit_mm = float(inputs.get("deflection_limit_mm") or 0.0)
     design_checked = bool(steel_design_results)
 
     checks: list[dict[str, Any]] = []
@@ -390,14 +802,38 @@ def _analyze_sap2000_model_inner(
             "pass": max_steel_ratio <= 1.0,
         })
 
-    disp_util = round(max_disp_mm / disp_limit_mm, 3) if disp_limit_mm > 0 else 0.0
-    checks.append({
-        "name": f"Max Nodal Deflection (joints only, Joint {gov_disp_joint}, Case {gov_disp_case})",
-        "demand": f"{max_disp_mm:.2f} mm",
-        "capacity": f"{disp_limit_mm:.2f} mm",
-        "util": disp_util,
-        "pass": max_disp_mm <= disp_limit_mm,
-    })
+    # Deflection. Default: every physical span relative to its supports, span/200
+    # (span/180 cantilever) under unfactored cases + SLS combos. An explicit
+    # `deflection_limit_mm` switches to the old absolute max-nodal check.
+    member_deflections: list[dict[str, Any]] = []
+    if explicit_disp_limit:
+        disp_util = round(max_disp_mm / disp_limit_mm, 3) if disp_limit_mm > 0 else 0.0
+        checks.append({
+            "name": f"Max Nodal Deflection (Joint {gov_disp_joint}, Case {gov_disp_case})",
+            "demand": f"{max_disp_mm:.2f} mm",
+            "capacity": f"{disp_limit_mm:.2f} mm",
+            "util": disp_util,
+            "pass": max_disp_mm <= disp_limit_mm,
+        })
+    elif geometry.get("frames"):
+        member_deflections = _member_deflections(
+            inputs, geometry, load_cases, load_combos, disp_by_case, moments_by_case, stiffness,
+        )
+        if member_deflections:
+            gov = member_deflections[0]
+            label = "Cantilever" if gov["cantilever"] else "Span"
+            fr = gov["frames"]
+            fr_txt = fr[0] if len(fr) == 1 else f"{fr[0]}…{fr[-1]}"
+            checks.append({
+                "name": (
+                    f"Member Deflection ({label} L={gov['span_m'] * 1000:.0f} mm, "
+                    f"Frame {fr_txt}, Case {gov['case']})"
+                ),
+                "demand": f"{gov['delta_mm']:.2f} mm",
+                "capacity": f"L/{gov['ratio']:.0f} = {gov['limit_mm']:.2f} mm",
+                "util": gov["util"],
+                "pass": gov["util"] <= 1.0,
+            })
 
     overall_pass: bool | None = all(c["pass"] for c in checks) if design_checked else None
     if design_checked:
@@ -416,7 +852,15 @@ def _analyze_sap2000_model_inner(
         "num_areas": num_areas,
         "load_cases": ", ".join(load_cases) if load_cases else "None",
         "load_combos": ", ".join(load_combos) if load_combos else "None",
-        "deflection_limit_mm": disp_limit_mm,
+        "deflection_limit_mm": disp_limit_mm if explicit_disp_limit else None,
+        "deflection_criteria": (
+            f"Absolute nodal ≤ {disp_limit_mm:g} mm" if explicit_disp_limit else
+            f"Span/{float(inputs.get('deflection_span_ratio') or 200):g}, "
+            f"cantilever/{float(inputs.get('cantilever_span_ratio') or 180):g} (relative to supports)"
+        ),
+        "excluded_cases": ", ".join(excluded_cases) if excluded_cases else "None",
+        "plot_combo": plot_combo,
+        "deflection_case": deflection_case,
     }
 
     return {
@@ -448,6 +892,8 @@ def _analyze_sap2000_model_inner(
         "support_reactions": support_reactions,
         "joint_displacements": joint_displacements,
         "steel_design_results": steel_design_results[:20],
+        "member_deflections": member_deflections[:20],
+        "views": views,
     }
 
 

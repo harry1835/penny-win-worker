@@ -37,6 +37,23 @@ from typing import Any
 
 from engines import autocad_engine, sap2000_engine
 
+
+def _git_commit() -> str:
+    """Short commit hash of the checkout this file lives in ('' if not a git repo)."""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+_RUNNING_COMMIT = _git_commit()
+
 log = logging.getLogger("penny_win_worker.server")
 
 
@@ -82,6 +99,11 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
                 "service": "penny-win-worker",
                 "sap2000_available": sap2000_engine.is_sap2000_available(),
                 "dll_path": str(sap2000_engine.DEFAULT_DLL_PATH),
+                # Commit this process loaded vs. what is checked out now. If they
+                # differ, the worker was not restarted after `git pull`.
+                "commit_running": _RUNNING_COMMIT,
+                "commit_on_disk": _git_commit(),
+                "restart_needed": _RUNNING_COMMIT != _git_commit(),
                 **dwg_info,
             })
             return
