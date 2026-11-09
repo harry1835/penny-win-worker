@@ -125,10 +125,40 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
             self._handle_sap2000_analyze(body)
         elif path == "/sap2000/build-portal":
             self._handle_sap2000_build_portal(body)
+        elif path in ("/mutate", "/sap2000/mutate"):
+            self._handle_sap2000_mutate(body)
         elif path == "/autocad/update-title-block":
             self._handle_autocad_title_block(body)
         else:
             self._send_json(404, {"error": f"Unknown path: {self.path}"})
+
+    def _handle_sap2000_mutate(self, body: dict[str, Any]) -> None:
+        ops = body.get("ops") or []
+        inputs = body.get("inputs") or {}
+        filename = body.get("filename") or "model.sdb"
+        file_b64 = body.get("file_b64")
+        model_path = body.get("model_path")
+        try:
+            if file_b64:
+                raw_bytes = base64.b64decode(file_b64)
+                with tempfile.TemporaryDirectory(prefix="sap_mut_up_", ignore_cleanup_errors=True) as up_dir:
+                    safe_name = Path(filename).name
+                    tmp_model = Path(up_dir) / safe_name
+                    tmp_model.write_bytes(raw_bytes)
+                    result = sap2000_engine.mutate_and_reanalyze_model(
+                        tmp_model, ops=ops, inputs=inputs, visible=self.visible, keep_open=self.keep_open
+                    )
+            elif model_path:
+                result = sap2000_engine.mutate_and_reanalyze_model(
+                    model_path, ops=ops, inputs=inputs, visible=self.visible, keep_open=self.keep_open
+                )
+            else:
+                self._send_json(400, {"error": "Provide 'file_b64' or 'model_path' for /sap2000/mutate."})
+                return
+            self._send_json(200, result)
+        except Exception as e:
+            log.exception("SAP2000 mutation failed")
+            self._send_json(500, {"error": str(e), "traceback": traceback.format_exc()})
 
     def _handle_sap2000_analyze(self, body: dict[str, Any]) -> None:
         inputs = body.get("inputs") or {}

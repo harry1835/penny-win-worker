@@ -1392,3 +1392,108 @@ def build_portal_frame_model(
         "dollar_2k_path": str(dollar_2k_path),
     }
     return res
+
+
+def apply_oapi_mutations(model: Any, ops: list[dict[str, Any]]) -> list[str]:
+    """Apply Tier-2 what-if change operations (`set_section`, `set_load`, `set_support`) directly via OAPI."""
+    descriptions: list[str] = []
+    ret_fnames = model.FrameObj.GetNameList(0, [])
+    frame_names = list(ret_fnames[2]) if (len(ret_fnames) >= 3 and ret_fnames[2]) else []
+    ret_pnames = model.PointObj.GetNameList(0, [])
+    point_names = list(ret_pnames[2]) if (len(ret_pnames) >= 3 and ret_pnames[2]) else []
+
+    for op in ops:
+        kind = str(op.get("op", "")).strip()
+        target = str(op.get("target", "all")).strip().upper()
+        val = op.get("value")
+
+        if kind == "set_section":
+            sec_str = str(val).strip()
+            matched = [
+                fn for fn in frame_names
+                if (
+                    target in ("ALL", "UNSPECIFIED", "*")
+                    or fn.upper() == target
+                    or (target in ("COLUMN", "COLUMNS", "COL") and fn.upper().startswith("C"))
+                    or (target in ("BEAM", "BEAMS", "RAFTER") and fn.upper().startswith("B"))
+                    or (target in ("PRIMARY_BEAM", "PRIMARY") and fn.upper().startswith("P"))
+                    or (target in ("SECONDARY_BEAM", "SECONDARY") and fn.upper().startswith("S"))
+                )
+            ] or [target]
+            for fn in matched:
+                model.FrameObj.SetSection(fn, sec_str)
+            descriptions.append(f"OAPI SetSection({matched} -> {sec_str})")
+
+        elif kind == "set_load":
+            pat = str(op.get("pattern") or target or "LIVE").strip().upper()
+            mag = float(val or 0.0)
+            matched = [
+                fn for fn in frame_names
+                if (
+                    target in ("ALL", "UNSPECIFIED", "*", pat)
+                    or fn.upper() == target
+                    or fn.upper().startswith("B")
+                    or fn.upper().startswith("S")
+                )
+            ] or (frame_names[:1] if frame_names else ["1"])
+            for fn in matched:
+                model.FrameObj.SetLoadDistributed(fn, pat, 1, 10, 0.0, 1.0, mag, mag, "Global", True, True)
+            descriptions.append(f"OAPI SetLoadDistributed({matched}, {pat}={mag:g})")
+
+        elif kind == "set_support":
+            sup_str = str(val).strip().lower()
+            rbools = (
+                [True, True, True, True, False, True]
+                if "pin" in sup_str
+                else [True, True, True, True, True, True]
+            )
+            for pn in (point_names or ["1", "4"]):
+                try:
+                    model.PointObj.SetRestraint(pn, rbools)
+                except Exception:
+                    pass
+            descriptions.append(f"OAPI SetRestraint({point_names} -> {sup_str})")
+
+    return descriptions
+
+
+def mutate_and_reanalyze_model(
+    model_path: str | Path,
+    ops: list[dict[str, Any]],
+    inputs: dict[str, Any] | None = None,
+    visible: bool = True,
+    keep_open: bool = False,
+) -> dict[str, Any]:
+    """Open `.sdb`/`.s2k`, apply OAPI mutations, save, and rerun analysis."""
+    src_path = Path(model_path).resolve()
+    if not src_path.exists():
+        raise FileNotFoundError(f"SAP2000 model file not found: {src_path}")
+
+    sap = _load_sap_module()
+    _init_com_thread()
+    try:
+        with _SAP_LOCK:
+            with tempfile.TemporaryDirectory(prefix="sap_mut_", ignore_cleanup_errors=True) as tmp_dir:
+                work_path = Path(tmp_dir) / src_path.name
+                shutil.copy2(src_path, work_path)
+                sap_obj, attached = _acquire_sap_object(sap, visible)
+                try:
+                    model = sap_obj.SapModel
+                    ret = model.File.OpenFile(str(work_path))
+                    if ret != 0:
+                        raise RuntimeError(f"SAP2000 File.OpenFile({work_path.name}) failed with code {ret}")
+                    try:
+                        model.SetModelIsLocked(False)
+                    except Exception:
+                        pass
+                    descs = apply_oapi_mutations(model, ops)
+                    model.File.Save(str(work_path))
+                finally:
+                    if not attached and not keep_open:
+                        _close_sap_object()
+                res = analyze_sap2000_model(work_path, inputs=inputs, visible=visible, keep_open=keep_open)
+                res["changed_descriptions"] = descs
+                return res
+    finally:
+        _uninit_com_thread()
+
