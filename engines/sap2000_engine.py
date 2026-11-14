@@ -1206,9 +1206,17 @@ def prewarm_sap2000(visible: bool = True) -> bool:
             sap = _load_sap_module()
             helper_iface = sap.cHelper(sap.Helper())
             if helper_iface.GetObject("CSI.SAP2000.API.SapObject") is not None:
-                return False  # already running (someone's session or a previous worker)
+                # Already running (someone's session or a previous worker). Log it
+                # once: jobs will attach to that instance, whatever state it is in.
+                if not getattr(prewarm_sap2000, "_logged_existing", False):
+                    log.info("Pre-start skipped: a SAP2000 is already running; jobs will attach to it")
+                    prewarm_sap2000._logged_existing = True
+                return False
+            log.info("Pre-starting SAP2000 for working hours...")
             sap_obj = helper_iface.CreateObjectProgID("CSI.SAP2000.API.SapObject")
-            if sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible) != 0:
+            ret = sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible)
+            if ret != 0:
+                log.warning("Pre-start failed: SAP2000 ApplicationStart returned %s", ret)
                 return False
             _SAP_STATE.owned = True
             _SAP_STATE.last_used = time.monotonic()
