@@ -5,7 +5,7 @@ Starting SAP2000 or AutoCAD costs far more than the work Penny asks of them,
 but each holds ~0.5–1 GB of RAM. On an 8 GB VM they are kept open only when
 that pays off:
 
-  SAP2000  open all working hours (default Mon–Fri 09:00–17:00, VM local time),
+  SAP2000  open all working hours (default Mon–Sat 08:00–21:00, VM local time),
            pre-started at the start of the day so the first job is quick.
            Outside working hours: started on demand, closed after
            SAP2000_OFF_HOURS_IDLE_MIN (default 10) idle minutes.
@@ -18,7 +18,7 @@ with no drawing open), so a SAP2000 / AutoCAD session someone is using on the
 VM is never shut down.
 
 Environment:
-  WORK_HOURS="09:00-17:00"   WORK_DAYS="Mon-Fri"
+  WORK_HOURS="08:00-21:00"   WORK_DAYS="Mon-Sat"
   SAP2000_PREWARM=1          SAP2000_OFF_HOURS_IDLE_MIN=10   AUTOCAD_IDLE_MIN=5
 """
 from __future__ import annotations
@@ -66,10 +66,10 @@ def parse_days(spec: str) -> set[int]:
 def in_work_hours(now: datetime | None = None) -> bool:
     now = now or datetime.now()
     try:
-        start, end = parse_hours(os.getenv("WORK_HOURS", "09:00-17:00"))
-        days = parse_days(os.getenv("WORK_DAYS", "Mon-Fri"))
+        start, end = parse_hours(os.getenv("WORK_HOURS", "08:00-21:00"))
+        days = parse_days(os.getenv("WORK_DAYS", "Mon-Sat"))
     except (ValueError, IndexError):
-        start, end, days = 540, 1020, {0, 1, 2, 3, 4}
+        start, end, days = 480, 1260, {0, 1, 2, 3, 4, 5}
     m = now.hour * 60 + now.minute
     return now.weekday() in days and start <= m < end
 

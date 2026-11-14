@@ -17,6 +17,8 @@ from engines import app_keeper, autocad_engine, sap2000_engine
 
 MON_10AM = datetime(2026, 11, 9, 10, 0)   # Monday
 MON_6PM = datetime(2026, 11, 9, 18, 0)
+MON_930PM = datetime(2026, 11, 9, 21, 30)
+SUN_10AM = datetime(2026, 11, 8, 10, 0)
 SAT_10AM = datetime(2026, 11, 7, 10, 0)
 
 
@@ -26,10 +28,13 @@ class TestPolicy(unittest.TestCase):
             os.environ.pop("WORK_HOURS", None)
             os.environ.pop("WORK_DAYS", None)
             self.assertTrue(app_keeper.in_work_hours(MON_10AM))
-            self.assertFalse(app_keeper.in_work_hours(MON_6PM))
-            self.assertFalse(app_keeper.in_work_hours(SAT_10AM))
+            self.assertTrue(app_keeper.in_work_hours(MON_6PM))
+            self.assertTrue(app_keeper.in_work_hours(SAT_10AM))
+            self.assertFalse(app_keeper.in_work_hours(MON_930PM))
+            self.assertFalse(app_keeper.in_work_hours(SUN_10AM))
             self.assertIsNone(app_keeper.sap2000_idle_limit_s(MON_10AM))
-            self.assertEqual(app_keeper.sap2000_idle_limit_s(MON_6PM), 600.0)
+            self.assertIsNone(app_keeper.sap2000_idle_limit_s(SAT_10AM))
+            self.assertEqual(app_keeper.sap2000_idle_limit_s(MON_930PM), 600.0)
 
     def test_custom_hours_and_days(self):
         with patch.dict(os.environ, {"WORK_HOURS": "08:30-18:30", "WORK_DAYS": "Mon-Sat"}):
@@ -60,15 +65,20 @@ class TestSap2000Reaper(unittest.TestCase):
         self.assertFalse(self._reap(MON_10AM, now_s=99_999))
         self.assertEqual(self.exits, [])
 
+    def test_kept_open_saturday_and_evening(self):
+        self.assertFalse(self._reap(SAT_10AM, now_s=99_999))
+        self.assertFalse(self._reap(MON_6PM, now_s=99_999))
+        self.assertEqual(self.exits, [])
+
     def test_closed_after_idle_off_hours(self):
-        self.assertFalse(self._reap(MON_6PM, now_s=300))    # 5 min idle: keep
-        self.assertTrue(self._reap(MON_6PM, now_s=700))     # 11+ min idle: close
+        self.assertFalse(self._reap(MON_930PM, now_s=300))    # 5 min idle: keep
+        self.assertTrue(self._reap(MON_930PM, now_s=700))     # 11+ min idle: close
         self.assertEqual(self.exits, [False])
         self.assertFalse(sap2000_engine._SAP_STATE.owned)
 
     def test_someone_elses_sap2000_is_never_closed(self):
         sap2000_engine._SAP_STATE.owned = False
-        self.assertFalse(self._reap(MON_6PM, now_s=99_999))
+        self.assertFalse(self._reap(MON_930PM, now_s=99_999))
         self.assertEqual(self.exits, [])
 
 
