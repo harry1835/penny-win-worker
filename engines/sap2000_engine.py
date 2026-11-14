@@ -645,6 +645,10 @@ def _analyze_sap2000_model_inner(
         now = time.monotonic()
         timings[name] = round(now - t_last, 2)
         t_last = now
+        # Logged as it happens, so a job killed by the watchdog still shows
+        # the last stage it finished (the final timings line only prints on success).
+        log.info("SAP2000 %s: %s done in %.1fs (%.1fs total)",
+                 src_path.name, name, timings[name], now - t_start)
 
     _init_com_thread()
     try:
@@ -662,6 +666,7 @@ def _analyze_sap2000_model_inner(
                 attached = False
                 _SAP_STATE.owned = False
                 sap_obj = helper_iface.CreateObjectProgID("CSI.SAP2000.API.SapObject")
+                log.info("SAP2000 %s: no running SAP2000 to attach to, starting one (cold start)", src_path.name)
                 ret = sap_obj.ApplicationStart(sap.eUnits.kN_m_C, visible)
                 if ret != 0:
                     raise RuntimeError(f"SAP2000 ApplicationStart failed with code {ret}")
@@ -711,6 +716,7 @@ def _analyze_sap2000_model_inner(
                 stamp("open_model")
 
                 # Run structural analysis
+                log.info("SAP2000 %s: running analysis", src_path.name)
                 ret = model.Analyze.RunAnalysis()
                 if ret != 0:
                     raise RuntimeError(f"SAP2000 Analyze.RunAnalysis() failed with code {ret}")
