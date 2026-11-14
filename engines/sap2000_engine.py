@@ -29,7 +29,7 @@ DEFAULT_SAP_DIR = Path(os.getenv(
     r"C:\Program Files\Computers and Structures\SAP2000 25",
 ))
 DEFAULT_DLL_PATH = DEFAULT_SAP_DIR / "SAP2000v1.dll"
-SAP2000_EXEC_TIMEOUT = int(os.getenv("SAP2000_EXEC_TIMEOUT", "480"))  # cold start alone ~170 s
+SAP2000_EXEC_TIMEOUT = int(os.getenv("SAP2000_EXEC_TIMEOUT", "600"))  # 10-min window; cold start alone ~170 s
 # Load-case types whose solution needs the modal case (response spectrum,
 # modal time history / steady state / PSD). Modal is only skipped without them.
 _NEEDS_MODAL_TYPES = {4, 5, 7, 11, 12}
