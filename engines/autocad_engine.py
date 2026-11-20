@@ -925,3 +925,302 @@ def reap_idle_autocad(now: float | None = None) -> bool:
             pythoncom.CoUninitialize()
     finally:
         _CAD_LOCK.release()
+
+
+# ── Direct AutoCAD COM extraction (#194) & parametric drawing (#195) ────
+def _extract_entities_from_com_doc(doc: Any) -> dict[str, Any]:
+    """Read lines, polylines, text/mtext, and dimensions directly from an open AutoCAD COM Document."""
+    try:
+        insunits = int(_com_retry(lambda: doc.GetVariable("INSUNITS")) or 4)
+    except Exception:
+        insunits = 4
+
+    lines: list[dict[str, Any]] = []
+    texts: list[dict[str, Any]] = []
+    dimensions: list[dict[str, Any]] = []
+    layers: set[str] = set()
+
+    msp = _com_retry(lambda: doc.ModelSpace)
+    count = int(_com_retry(lambda: msp.Count) or 0)
+    for i in range(count):
+        try:
+            ent = _com_retry(lambda idx=i: msp.Item(idx))
+            otype = str(_com_retry(lambda e=ent: e.ObjectName) or "")
+            layer = str(_com_retry(lambda e=ent: e.Layer) or "0")
+            layers.add(layer)
+
+            if otype == "AcDbLine":
+                sp = _com_retry(lambda e=ent: e.StartPoint)
+                ep = _com_retry(lambda e=ent: e.EndPoint)
+                lines.append({
+                    "x1": float(sp[0]), "y1": float(sp[1]),
+                    "x2": float(ep[0]), "y2": float(ep[1]),
+                    "layer": layer,
+                })
+            elif otype in ("AcDbPolyline", "AcDb2dPolyline"):
+                coords = list(_com_retry(lambda e=ent: e.Coordinates) or [])
+                step = 2 if otype == "AcDbPolyline" else 3
+                pts = [(float(coords[k]), float(coords[k + 1])) for k in range(0, len(coords) - 1, step)]
+                closed = bool(_com_retry(lambda e=ent: getattr(e, "Closed", False)))
+                if closed and len(pts) >= 3:
+                    pts.append(pts[0])
+                for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                    lines.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+            elif otype in ("AcDbText", "AcDbMText"):
+                txt = str(_com_retry(lambda e=ent: e.TextString) or "").strip()
+                ins = _com_retry(lambda e=ent: e.InsertionPoint)
+                if txt:
+                    texts.append({
+                        "text": txt,
+                        "x": float(ins[0]), "y": float(ins[1]),
+                        "layer": layer,
+                    })
+            elif "Dimension" in otype:
+                meas = float(_com_retry(lambda e=ent: getattr(e, "Measurement", 0.0)) or 0.0)
+                override = str(_com_retry(lambda e=ent: getattr(e, "TextOverride", "")) or "").strip()
+                dimensions.append({
+                    "measured": round(meas, 3),
+                    "text_override": override,
+                    "layer": layer,
+                })
+        except Exception as e:
+            log.debug(f"Skipping AutoCAD entity {i}: {e}")
+
+    return {
+        "insunits": insunits,
+        "lines": lines,
+        "texts": texts,
+        "dimensions": dimensions,
+        "layers": sorted(layers),
+        "engine": "autocad_com",
+    }
+
+
+def _extract_dwg_entities_inner(dwg_path: Path) -> dict[str, Any]:
+    if not is_autocad_com_available():
+        raise RuntimeError("AutoCAD COM is not available on this worker.")
+
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    prev_filter = _register_busy_message_filter(pythoncom)
+    doc = None
+    try:
+        acad = _start_autocad(win32com.client)
+        _wait_until_idle(acad)
+        _close_if_open(acad, dwg_path)
+        doc = _com_retry(lambda: acad.Documents.Open(str(dwg_path.resolve()), True))
+        _wait_until_idle(acad)
+        return _extract_entities_from_com_doc(doc)
+    finally:
+        if doc is not None:
+            try:
+                _com_retry(lambda: doc.Close(False))
+            except Exception:
+                pass
+        if prev_filter is not None:
+            try:
+                pythoncom.CoRegisterMessageFilter(prev_filter)
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+
+def extract_dwg_entities(dwg_path: Path, timeout_seconds: int | None = None) -> dict[str, Any]:
+    """Thread-safe, watchdog-guarded direct AutoCAD COM DWG entity extractor (#194)."""
+    timeout = timeout_seconds if timeout_seconds is not None else AUTOCAD_EXEC_TIMEOUT
+    with _CAD_LOCK:
+        return run_with_watchdog(
+            _extract_dwg_entities_inner,
+            dwg_path,
+            timeout_seconds=timeout,
+            kill_on_timeout=["acad.exe"],
+        )
+
+
+def _vt_pt(x: float, y: float, z: float = 0.0) -> Any:
+    try:
+        import pythoncom
+        import win32com.client
+        return win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(x), float(y), float(z)))
+    except ImportError:
+        return (float(x), float(y), float(z))
+
+
+def _add_com_rect(msp: Any, x0: float, y0: float, w: float, h: float, layer: str) -> None:
+    pts = [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h), (x0, y0)]
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        ln = msp.AddLine(_vt_pt(ax, ay), _vt_pt(bx, by))
+        ln.Layer = layer
+
+
+def _draw_baseplate_on_com_doc(doc: Any, report: dict[str, Any], geom: dict[str, Any]) -> None:
+    """Draw the 4-view parametric base-plate connection detail directly via AutoCAD COM (#195)."""
+    layers = doc.Layers
+    for lname, color in (
+        ("S-PLATE", 4), ("S-PROFILE", 7), ("S-ANCHOR", 1),
+        ("S-CONC", 8), ("S-DIM", 3), ("S-TEXT", 2), ("TITLE_BLOCK", 7),
+    ):
+        lyr = layers.Add(lname)
+        lyr.color = color
+
+    msp = doc.ModelSpace
+    L = float(report.get("plate_L_mm", 150.0))
+    B = float(report.get("plate_B_mm", 150.0))
+    tp = float(report.get("plate_t_mm", 12.0))
+    d = float(report.get("anchor_diameter_mm", 10.0))
+    hef = float(report.get("hef_mm", 44.0))
+    hnom = float(report.get("hnom_mm", 54.0))
+    slab_h = float(report.get("slab_thickness_mm", 150.0))
+    prof_h = float(report.get("profile_h_mm", 50.0))
+    prof_b = float(report.get("profile_b_mm", 50.0))
+    col_stub = min(max(120.0, float(report.get("member_height_mm", 220.0))), 300.0)
+    grout = float(report.get("grout_thickness_mm") or 0.0)
+    coords = geom.get("coords_mm") or [[-L * 0.35, -B * 0.35], [L * 0.35, -B * 0.35], [L * 0.35, B * 0.35], [-L * 0.35, B * 0.35]]
+    sx = float(geom.get("spacing_x_mm", L * 0.7))
+    sy = float(geom.get("spacing_y_mm", B * 0.7))
+
+    pitch_x = max(L + 280.0, 500.0)
+    pitch_y = max(B + slab_h + col_stub + 200.0, 520.0)
+
+    # 1. Plan view
+    px, py = 220.0, pitch_y + 200.0
+    _add_com_rect(msp, px - L / 2, py - B / 2, L, B, "S-PLATE")
+    _add_com_rect(msp, px - prof_b / 2, py - prof_h / 2, prof_b, prof_h, "S-PROFILE")
+    for ax, ay in coords:
+        cx, cy = px + float(ax), py + float(ay)
+        c = msp.AddCircle(_vt_pt(cx, cy), d / 2.0)
+        c.Layer = "S-ANCHOR"
+    t1 = msp.AddText("1. PLAN VIEW", _vt_pt(px - L / 2, py - B / 2 - 70), 14.0)
+    t1.Layer = "S-TEXT"
+
+    # 2. Front elevation
+    fx, fy = px + pitch_x, py
+    conc_w = L + 160.0
+    _add_com_rect(msp, fx - conc_w / 2, fy - slab_h, conc_w, slab_h, "S-CONC")
+    _add_com_rect(msp, fx - L / 2, fy + grout, L, tp, "S-PLATE")
+    _add_com_rect(msp, fx - prof_b / 2, fy + grout + tp, prof_b, col_stub, "S-PROFILE")
+    for ax in (-sx / 2.0, sx / 2.0):
+        _add_com_rect(msp, fx + ax - d / 2, fy - hnom, d, hnom + grout + tp + 15.0, "S-ANCHOR")
+    t2 = msp.AddText("2. FRONT ELEVATION", _vt_pt(fx - conc_w / 2, fy - slab_h - 45), 14.0)
+    t2.Layer = "S-TEXT"
+
+    # 3. Side elevation
+    sx_o, sy_o = px, 240.0
+    conc_w_s = B + 160.0
+    _add_com_rect(msp, sx_o - conc_w_s / 2, sy_o - slab_h, conc_w_s, slab_h, "S-CONC")
+    _add_com_rect(msp, sx_o - B / 2, sy_o + grout, B, tp, "S-PLATE")
+    _add_com_rect(msp, sx_o - prof_h / 2, sy_o + grout + tp, prof_h, col_stub, "S-PROFILE")
+    for ay in (-sy / 2.0, sy / 2.0):
+        _add_com_rect(msp, sx_o + ay - d / 2, sy_o - hnom, d, hnom + grout + tp + 15.0, "S-ANCHOR")
+    t3 = msp.AddText("3. SIDE ELEVATION", _vt_pt(sx_o - conc_w_s / 2, sy_o - slab_h - 45), 14.0)
+    t3.Layer = "S-TEXT"
+
+    # 4. Section A-A through anchor
+    ax_o, ay_o = fx, sy_o
+    _add_com_rect(msp, ax_o - 120.0, ay_o - slab_h, 240.0, slab_h, "S-CONC")
+    _add_com_rect(msp, ax_o - 70.0, ay_o + grout, 140.0, tp, "S-PLATE")
+    _add_com_rect(msp, ax_o - d / 2, ay_o - hnom, d, hnom + grout + tp + 18.0, "S-ANCHOR")
+    t4 = msp.AddText(f"4. SECTION A-A (hef={hef:g}mm, hnom={hnom:g}mm)", _vt_pt(ax_o - 120.0, ay_o - slab_h - 45), 12.0)
+    t4.Layer = "S-TEXT"
+
+    # 5. Schedule & Title Block
+    tx, ty = fx + pitch_x * 0.75, py + B / 2 + 100.0
+    weld = f"{report['weld_leg_mm']:g}mm FW ALL AROUND" if report.get("weld_leg_mm") else "TO BE CONFIRMED"
+    sched = [
+        "ANCHOR & BASE PLATE SCHEDULE",
+        f"ANCHOR: {len(coords)}x HILTI {report.get('anchor_type', 'TBC')} (hef={hef:g}mm, hnom={hnom:g}mm)",
+        f"PLATE:  {L:g}x{B:g}x{tp:g}mm | PROFILE: {report.get('profile', 'TBC')}",
+        f"BASE:   {report.get('concrete_grade', 'C20/25')}, h={slab_h:g}mm | WELD: {weld}",
+        "STATUS: FOR PE REVIEW - VERIFY ALL 'TO BE CONFIRMED' ITEMS",
+    ]
+    _add_com_rect(msp, tx - 15.0, ty - len(sched) * 26.0 - 15.0, 460.0, len(sched) * 26.0 + 35.0, "TITLE_BLOCK")
+    for idx, line in enumerate(sched):
+        txt_obj = msp.AddText(line, _vt_pt(tx, ty - idx * 26.0), 10.0)
+        txt_obj.Layer = "S-TEXT"
+
+
+def _draw_baseplate_detail_inner(report: dict[str, Any], geom: dict[str, Any], out_dir: Path, stem: str) -> dict[str, Any]:
+    if not is_autocad_com_available():
+        raise RuntimeError("AutoCAD COM is not available on this worker.")
+
+    import pythoncom
+    import win32com.client
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dwg_path = out_dir / f"{stem}_detail.dwg"
+    pdf_path = out_dir / f"{stem}_detail.pdf"
+
+    pythoncom.CoInitialize()
+    prev_filter = _register_busy_message_filter(pythoncom)
+    doc = None
+    try:
+        acad = _start_autocad(win32com.client)
+        _wait_until_idle(acad)
+        template_env = os.getenv("AUTOCAD_TEMPLATE_DWG", "").strip()
+        if template_env and Path(template_env).is_file():
+            doc = _com_retry(lambda: acad.Documents.Open(template_env, True))
+        else:
+            doc = _com_retry(lambda: acad.Documents.Add())
+        _wait_until_idle(acad)
+
+        _draw_baseplate_on_com_doc(doc, report, geom)
+        try:
+            acad.ZoomExtents()
+        except Exception:
+            pass
+
+        _com_retry(lambda: doc.SaveAs(str(dwg_path.resolve())))
+
+        pdf_ok = False
+        try:
+            layout = doc.ActiveLayout
+            layout.ConfigName = "DWG To PDF.pc3"
+            layout.PlotType = 1  # acExtents
+            layout.CenterPlot = True
+            layout.StandardScale = 0  # acScaleToFit
+            doc.Plot.PlotToFile(str(pdf_path.resolve()))
+            pdf_ok = pdf_path.is_file() and pdf_path.stat().st_size > 0
+        except Exception as e:
+            log.warning(f"AutoCAD PlotToFile PDF skipped: {e}")
+
+        return {
+            "dwg_path": dwg_path,
+            "pdf_path": pdf_path if pdf_ok else None,
+            "engine": "autocad_com",
+        }
+    finally:
+        if doc is not None:
+            try:
+                _com_retry(lambda: doc.Close(False))
+            except Exception:
+                pass
+        if prev_filter is not None:
+            try:
+                pythoncom.CoRegisterMessageFilter(prev_filter)
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+
+
+def draw_baseplate_detail(
+    report: dict[str, Any],
+    geom: dict[str, Any],
+    out_dir: Path,
+    stem: str = "baseplate",
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Thread-safe, watchdog-guarded direct AutoCAD COM base-plate detail drawer (#195)."""
+    timeout = timeout_seconds if timeout_seconds is not None else AUTOCAD_EXEC_TIMEOUT
+    with _CAD_LOCK:
+        return run_with_watchdog(
+            _draw_baseplate_detail_inner,
+            report,
+            geom,
+            out_dir,
+            stem,
+            timeout_seconds=timeout,
+            kill_on_timeout=["acad.exe"],
+        )
+

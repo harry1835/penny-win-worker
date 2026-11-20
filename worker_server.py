@@ -129,6 +129,10 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
             self._handle_sap2000_mutate(body)
         elif path == "/autocad/update-title-block":
             self._handle_autocad_title_block(body)
+        elif path == "/autocad/extract-dwg":
+            self._handle_autocad_extract_dwg(body)
+        elif path == "/autocad/draw-baseplate":
+            self._handle_autocad_draw_baseplate(body)
         else:
             self._send_json(404, {"error": f"Unknown path: {self.path}"})
 
@@ -273,6 +277,53 @@ class PennyWindowsWorkerHandler(BaseHTTPRequestHandler):
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             })
+
+    def _handle_autocad_extract_dwg(self, body: dict[str, Any]) -> None:
+        filename = body.get("filename") or "drawing.dwg"
+        file_b64 = body.get("file_b64")
+        if not file_b64:
+            self._send_json(400, {"error": "Missing required field 'file_b64'."})
+            return
+        try:
+            raw_bytes = base64.b64decode(file_b64)
+            with tempfile.TemporaryDirectory(prefix="cad_ext_", ignore_cleanup_errors=True) as up_dir:
+                safe_name = Path(filename).name
+                if not safe_name.lower().endswith(".dwg"):
+                    safe_name += ".dwg"
+                tmp_dwg = Path(up_dir) / safe_name
+                tmp_dwg.write_bytes(raw_bytes)
+                extracted = autocad_engine.extract_dwg_entities(tmp_dwg)
+                self._send_json(200, {"ok": True, **extracted})
+        except Exception as e:
+            log.exception("AutoCAD direct DWG extraction failed")
+            self._send_json(500, {"error": str(e), "traceback": traceback.format_exc()})
+
+    def _handle_autocad_draw_baseplate(self, body: dict[str, Any]) -> None:
+        report = body.get("report")
+        geom = body.get("geometry") or {}
+        stem = Path(str(body.get("stem") or "baseplate")).stem
+        if not isinstance(report, dict):
+            self._send_json(400, {"error": "Missing required dict field 'report'."})
+            return
+        try:
+            with tempfile.TemporaryDirectory(prefix="cad_bp_", ignore_cleanup_errors=True) as out_dir:
+                res = autocad_engine.draw_baseplate_detail(report, geom, Path(out_dir), stem=stem)
+                dwg_path = res.get("dwg_path")
+                pdf_path = res.get("pdf_path")
+                payload: dict[str, Any] = {
+                    "ok": bool(dwg_path and dwg_path.is_file()),
+                    "engine": res.get("engine", "autocad_com"),
+                    "dwg_filename": dwg_path.name if dwg_path else f"{stem}_detail.dwg",
+                    "pdf_filename": pdf_path.name if pdf_path else None,
+                }
+                if dwg_path and dwg_path.is_file():
+                    payload["dwg_b64"] = base64.b64encode(dwg_path.read_bytes()).decode("ascii")
+                if pdf_path and pdf_path.is_file():
+                    payload["pdf_b64"] = base64.b64encode(pdf_path.read_bytes()).decode("ascii")
+                self._send_json(200, payload)
+        except Exception as e:
+            log.exception("AutoCAD direct baseplate drawing failed")
+            self._send_json(500, {"error": str(e), "traceback": traceback.format_exc()})
 
 
 def serve_worker(
